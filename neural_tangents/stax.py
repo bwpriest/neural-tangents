@@ -68,6 +68,7 @@ import enum
 import functools
 import operator as op
 import string
+import types
 from typing import Tuple, List, Optional, Iterable, Callable, Union
 import warnings
 
@@ -288,7 +289,7 @@ def _supports_masking(remask_kernel: bool):
 
 
 @layer
-def serial(*layers):
+def serial(*layers, gen=False):
   """Combinator for composing layers in serial.
 
   Based on `jax.experimental.stax.serial`.
@@ -296,6 +297,8 @@ def serial(*layers):
   Args:
     :layers: a sequence of layers, each an `(init_fn, apply_fn, kernel_fn)`
       triple.
+    :gen: bool, default `False`. Indicates whether the kernel_fn should return 
+      a `Kernel` or a generator of `Kernel`s.
 
   Returns:
     A new layer, meaning an `(init_fn, apply_fn, kernel_fn)` triple,
@@ -305,11 +308,18 @@ def serial(*layers):
   init_fns, apply_fns, kernel_fns = zip(*layers)
   init_fn, apply_fn = ostax.serial(*zip(init_fns, apply_fns))
 
-  @_requires(**_get_input_req_attr(kernel_fns))
-  def kernel_fn(kernels):
-    for f in kernel_fns:
-      kernels = f(kernels)
-    return kernels
+  if gen is False:
+    @_requires(**_get_input_req_attr(kernel_fns))
+    def kernel_fn(kernels):
+      for f in kernel_fns:
+        kernels = f(kernels)
+      return kernels
+  else:
+    @_requires(**_get_input_req_attr(kernel_fns))
+    def kernel_fn(kernels):
+      for f in kernel_fns:
+        kernels = f(kernels)
+        yield kernels
 
   return init_fn, apply_fn, kernel_fn
 
@@ -1903,9 +1913,14 @@ def _set_shapes(init_fn, in_kernel, out_kernel):
   elif isinstance(out_kernel, list):
     return [k.replace(shape1=s1, shape2=s2) for
             k, s1, s2 in zip(out_kernel, shape1, shape2)]
+  elif isinstance(out_kernel, types.GeneratorType):
+    # NOTE(bwpriest) This is presently making the unsafe assumption that the 
+    # out_kernel's interior elements are not lists.
+    return (k.replace(shape1=shape1, shape2=shape2) for k in out_kernel)
   else:
-    raise TypeError(f'Expected output kernel to be a `Kernel` or a list of '
-                    f'`Kernel`s. Found {type(out_kernel)}.')
+    raise TypeError(f'Expected output kernel to be a `Kernel`, a list of '
+                    f'`Kernel`s, or a generator of `Kernels`. Found '
+                    f'{type(out_kernel)}.')
 
 
 def _fuse_reqs(kernel_fn_reqs, default_reqs, **user_reqs):

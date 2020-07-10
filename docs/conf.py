@@ -12,6 +12,10 @@
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 #
+
+"""Readthedocs configuration."""
+
+
 import os
 import sys
 sys.path.insert(0, os.path.abspath('..'))
@@ -22,10 +26,6 @@ project = u'Neural Tangents'
 copyright = u'2019, Google LLC.'
 author = u'The Neural Tangents Authors'
 
-# The short X.Y version
-version = u''
-# The full version, including alpha/beta/rc tags
-release = u'0.1.8'
 
 # -- General configuration ---------------------------------------------------
 
@@ -161,8 +161,12 @@ man_pages = [
 # (source start file, target name, title, author,
 #  dir menu entry, description, category)
 texinfo_documents = [
-    (master_doc, 'NeuralTangents', u'Neural Tangents Documentation',
-     author, 'NeuralTangents', 'One line description of project.',
+    (master_doc,
+     'NeuralTangents',
+     u'Neural Tangents Documentation',
+     author,
+     'NeuralTangents',
+     'Neural Tangents: Fast and Easy Infinite Neural Networks in Python',
      'Miscellaneous'),
 ]
 
@@ -190,4 +194,4 @@ epub_exclude_files = ['search.html']
 # -- Options for intersphinx extension ---------------------------------------
 
 autodoc_mock_imports = [
-    "frozendict", "jax", "absl", "numpy", "scipy"]
+    'frozendict', 'jax', 'absl', 'numpy', 'scipy']

@@ -1,5 +1,3 @@
-# Lint as: python3
-
 # Copyright 2020 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,27 +19,25 @@ This code was copied and adapted from https://github.com/google/flax/struct.py.
 Accessed on 03/23/2020.
 """
 
+from typing import Dict, Any, Tuple
+
 import dataclasses
 import jax
-
-
-replace = dataclasses.replace
-asdict = dataclasses.asdict
-astuple = dataclasses.astuple
 
 
 def dataclass(clz):
   """Create a class which can be passed to functional transformations.
 
   Jax transformations such as `jax.jit` and `jax.grad` require objects that are
-  immutable and can be mapped over using the `jax.tree_util` methods.
+  immutable and can be mapped over using the `jax.tree_util` functions.
   The `dataclass` decorator makes it easy to define custom classes that can be
   passed safely to Jax. For example:
 
+  >>>  from jax import jit, numpy as np
   >>>  from neural_tangents.utils import dataclasses
   >>>
   >>>  @dataclasses.dataclass
-  >>>  class Data():
+  >>>  class Data:
   >>>    array: np.ndarray
   >>>    a_boolean: bool = dataclasses.field(pytree_node=False)
   >>>
@@ -54,7 +50,7 @@ def dataclass(clz):
   >>>  jit(lambda data: data.array if data.a_boolean else 0)(data)
 
   Args:
-    :clz: the class that will be transformed by the decorator.
+    clz: the class that will be transformed by the decorator.
 
   Returns:
     The new class.
@@ -85,8 +81,21 @@ def dataclass(clz):
                                      iterate_clz,
                                      clz_from_iterable)
 
+  def replace(self: data_clz, **kwargs) -> data_clz:
+    return dataclasses.replace(self, **kwargs)
+
+  def asdict(self: data_clz) -> Dict[str, Any]:
+    return dataclasses.asdict(self)
+
+  def astuple(self: data_clz) -> Tuple[Any, ...]:
+    return dataclasses.astuple(self)
+
+  data_clz.replace = replace
+  data_clz.asdict = asdict
+  data_clz.astuple = astuple
+
   return data_clz
 
 
-def field(pytree_node=True, **kwargs):
+def field(pytree_node: bool = True, **kwargs):
   return dataclasses.field(metadata={'pytree_node': pytree_node}, **kwargs)

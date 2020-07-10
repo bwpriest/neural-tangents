@@ -1,5 +1,3 @@
-# Lint as: python3
-
 # Copyright 2019 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,14 +14,15 @@
 
 """Utilities for testing."""
 
+
 import logging
+
 import dataclasses
 from jax.api import jit
 from jax.api import vmap
 from jax.lib import xla_bridge
 import jax.numpy as np
 import jax.test_util as jtu
-import numpy as onp
 from .kernel import Kernel
 import numpy as onp
 
@@ -91,7 +90,16 @@ def assert_close_matrices(self, expected, actual, rtol):
 
 
 class NeuralTangentsTestCase(jtu.JaxTestCase):
-  def assertAllClose(self, x, y, check_dtypes, atol=None, rtol=None):
+
+  def assertAllClose(
+      self,
+      x,
+      y,
+      *,
+      check_dtypes=True,
+      atol=None,
+      rtol=None,
+      canonicalize_dtypes=True):
     if isinstance(x, Kernel):
       self.assertIsInstance(y, Kernel)
       x_dict = dataclasses.asdict(x)
@@ -100,8 +108,11 @@ class NeuralTangentsTestCase(jtu.JaxTestCase):
         is_pytree_node = field.metadata.get('pytree_node', True)
         if is_pytree_node:
           super().assertAllClose(
-              x_dict[field.name], y_dict[field.name], check_dtypes, atol, rtol)
+              x_dict[field.name], y_dict[field.name], check_dtypes=check_dtypes,
+              atol=atol, rtol=rtol, canonicalize_dtypes=canonicalize_dtypes)
         else:
           self.assertEqual(x_dict[field.name], y_dict[field.name])
     else:
-      return super().assertAllClose(x, y, check_dtypes, atol, rtol)
+      return super().assertAllClose(
+          x, y, check_dtypes=check_dtypes, atol=atol, rtol=rtol,
+          canonicalize_dtypes=canonicalize_dtypes)

@@ -1,5 +1,3 @@
-# Lint as: python3
-
 # Copyright 2019 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """Tests for `utils/monte_carlo.py`."""
 
-
-
+from absl.testing import absltest
 from jax import test_util as jtu
 from jax.config import config as jax_config
 from jax.lib import xla_bridge
@@ -47,7 +45,6 @@ ALL_GET = ('nngp', 'ntk', ('nngp', 'ntk'), None)
 test_utils.update_test_tolerance()
 
 
-
 def _get_inputs_and_model(width=1, n_classes=2, use_conv=True):
   key = random.PRNGKey(1)
   key, split = random.split(key)
@@ -74,7 +71,9 @@ class MonteCarloTest(jtu.JaxTestCase):
                            'device_count={} '
                            'store_on_device={} '
                            'get={} '
-                           ']'.format(batch_size, device_count, store_on_device,
+                           ']'.format(batch_size,
+                                      device_count,
+                                      store_on_device,
                                       get),
           'batch_size': batch_size,
           'device_count': device_count,
@@ -96,7 +95,7 @@ class MonteCarloTest(jtu.JaxTestCase):
 
     one_sample = sample_once_fn(x1, x2, key, get)
     one_sample_batch = sample_once_batch_fn(x1, x2, key, get)
-    self.assertAllClose(one_sample, one_sample_batch, True)
+    self.assertAllClose(one_sample, one_sample_batch)
 
   @jtu.parameterized.named_parameters(
       jtu.cases_from_list({
@@ -125,7 +124,7 @@ class MonteCarloTest(jtu.JaxTestCase):
                                        device_count, store_on_device)
     one_sample = sample_once_fn(x1, x2, key, get)
     one_batch_sample = batch_sample_once_fn(x1, x2, key, get)
-    self.assertAllClose(one_sample, one_batch_sample, True)
+    self.assertAllClose(one_sample, one_batch_sample)
 
   @jtu.parameterized.named_parameters(
       jtu.cases_from_list({
@@ -175,13 +174,10 @@ class MonteCarloTest(jtu.JaxTestCase):
         256, 2, xla_bridge.get_backend().platform == 'tpu')
 
     sample = monte_carlo.monte_carlo_kernel_fn(init_fn, apply_fn, key, 100,
-                                             batch_size, device_count,
-                                             store_on_device)
+                                               batch_size, device_count,
+                                               store_on_device)
 
     ker_empirical = sample(x1, x2, 'ntk')
-    ker_empirical = (
-        np.sum(ker_empirical, axis=(-1, -2)) / ker_empirical.shape[-1])
-
     ker_analytic = stax_kernel_fn(x1, x2, 'ntk')
 
     test_utils.assert_close_matrices(self, ker_analytic, ker_empirical, 2e-2)
@@ -226,9 +222,9 @@ class MonteCarloTest(jtu.JaxTestCase):
                                                       store_on_device)
         sample_12 = sample_fn(x1, x2)
         sample_34 = sample_fn(x3, x4)
-        self.assertAllClose(s_12, sample_12, True)
-        self.assertAllClose(s_12, s_34, True)
-        self.assertAllClose(s_12, sample_34, True)
+        self.assertAllClose(s_12, sample_12)
+        self.assertAllClose(s_12, s_34)
+        self.assertAllClose(s_12, sample_34)
         count += 1
 
       self.assertEqual(log_n_max, count)
@@ -247,9 +243,9 @@ class MonteCarloTest(jtu.JaxTestCase):
             device_count, store_on_device)
         sample_12 = sample_fn(x1, x2, get)
         sample_34 = sample_fn(x3, x4, get)
-        self.assertAllClose(s_12, sample_12, True)
-        self.assertAllClose(s_12, s_34, True)
-        self.assertAllClose(s_12, sample_34, True)
+        self.assertAllClose(s_12, sample_12)
+        self.assertAllClose(s_12, s_34)
+        self.assertAllClose(s_12, sample_34)
         count += 1
 
       self.assertEqual(log_n_max, count)
@@ -257,14 +253,9 @@ class MonteCarloTest(jtu.JaxTestCase):
       ker_analytic_12 = stax_kernel_fn(x1, x2, get)
       ker_analytic_34 = stax_kernel_fn(x3, x4, get)
 
-    if get == 'ntk':
-      s_12 = np.squeeze(s_12, (-1, -2))
-    elif get is None or 'ntk' in get:
-      s_12 = s_12._replace(ntk=np.squeeze(s_12.ntk, (-1, -2)))
-
-    self.assertAllClose(ker_analytic_12, s_12, True, 2., 2.)
-    self.assertAllClose(ker_analytic_12, ker_analytic_34, True)
+    self.assertAllClose(ker_analytic_12, s_12, atol=2., rtol=2.)
+    self.assertAllClose(ker_analytic_12, ker_analytic_34)
 
 
 if __name__ == '__main__':
-  jtu.absltest.main()
+  absltest.main()

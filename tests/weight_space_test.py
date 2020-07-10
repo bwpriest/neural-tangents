@@ -1,5 +1,3 @@
-# Lint as: python3
-
 # Copyright 2019 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,13 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Describes flags used by neural tangents."""
+"""Tests for `examples/weight_space.py`."""
+
+from absl.testing import absltest
+
+from jax import test_util as jtu
+from jax.config import config
+from examples import weight_space
 
 
-from absl import flags  # type: ignore
+config.parse_flags_with_absl()
 
 
-flags.DEFINE_boolean(
-    'tangents_optimized', True,
-    '''Flag sets whether or not (potentially unsafe) optimizations are used.'''
-)
+class WeightSpaceTest(jtu.JaxTestCase):
+
+  def test_weight_space(self):
+    weight_space.main(None)
+
+
+if __name__ == '__main__':
+  absltest.main()

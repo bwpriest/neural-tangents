@@ -1,5 +1,3 @@
-# Lint as: python3
-
 # Copyright 2019 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License');
@@ -14,26 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Analytic NNGP and NTK library.
+"""Closed-form NNGP and NTK library.
 
 This library contains layer constructors mimicking those in
 `jax.experimental.stax` with similar API apart apart from:
 
 1) Instead of `(init_fn, apply_fn)` tuple, layer constructors return a triple
-  `(init_fn, apply_fn, kernel_fn)`, where the added `kernel_fn` maps an
-  `Kernel` to a new `Kernel`, and represents the change in the
-  analytic NTK and NNGP kernels (`Kernel.nngp`, `Kernel.ntk`). These functions
-  are chained / stacked together within the `serial` or `parallel`
-  combinators, similarly to `init_fn` and `apply_fn`.
+`(init_fn, apply_fn, kernel_fn)`, where the added `kernel_fn` maps a
+`Kernel` to a new `Kernel`, and represents the change in the
+analytic NTK and NNGP kernels (`Kernel.nngp`, `Kernel.ntk`). These functions
+are chained / stacked together within the `serial` or `parallel`
+combinators, similarly to `init_fn` and `apply_fn`.
 
 2) In layers with random weights, NTK parameterization is used by default
-  (https://arxiv.org/abs/1806.07572, page 3). Standard parameterization
-  (https://arxiv.org/abs/2001.07301) can be specified for `Conv` and `Dense`
-  layers by a keyword argument `parameterization`.
+(https://arxiv.org/abs/1806.07572, page 3). Standard parameterization
+(https://arxiv.org/abs/2001.07301) can be specified for `Conv` and `Dense`
+layers by a keyword argument `parameterization`.
 
 3) Some functionality may be missing (e.g. `BatchNorm`), and some may be
-  present only in our library (e.g. `CIRCULAR` padding, `LayerNorm`,
-  `GlobalAvgPool`, `GlobalSelfAttention` etc.).
+present only in our library (e.g. `CIRCULAR` padding, `LayerNorm`,
+`GlobalAvgPool`, `GlobalSelfAttention`, flexible batch and channel axes etc.).
 
 Example:
   >>>  from jax import random
@@ -55,21 +53,23 @@ Example:
   >>>      stax.Dense(10)
   >>>  )
   >>>
+  >>>  predict_fn = nt.predict.gradient_descent_mse_ensemble(kernel_fn, x_train,
+  >>>                                                        y_train)
+  >>>
   >>>  # (5, 10) np.ndarray NNGP test prediction
-  >>>  y_test_nngp = nt.predict.gp_inference(kernel_fn, x_train, y_train,
-  >>>                                        x_test, get='nngp')
+  >>>  y_test_nngp = predict_fn(x_test=x_test, get='nngp')
   >>>
   >>>  # (5, 10) np.ndarray NTK prediction
-  >>>  y_test_ntk = nt.predict.gp_inference(kernel_fn, x_train, y_train, x_test,
-  >>>                                       get='ntk')
+  >>>  y_test_ntk = predict_fn(x_test=x_test, get='ntk')
 """
+
 
 import enum
 import functools
 import operator as op
 import string
 import types
-from typing import Tuple, List, Optional, Iterable, Callable, Union
+from typing import Union, Tuple, Callable, Iterable, Dict, List, Optional
 import warnings
 
 import frozendict
@@ -85,25 +85,24 @@ import jax.interpreters.partial_eval as pe
 from jax.lib import xla_bridge
 from jax.scipy.special import erf
 from jax.tree_util import tree_map, tree_flatten, tree_unflatten
-
-from neural_tangents.utils.kernel import Kernel
 from neural_tangents.utils import utils
+from neural_tangents.utils.kernel import Kernel
+from neural_tangents.utils.typing import InitFn, AnalyticKernelFn, \
+  LayerKernelFn, InternalLayer, Layer, Kernels, Shapes, Axes
 
-from neural_tangents.utils.typing import (
-    InitFn, AnalyticKernelFn, LayerKernelFn,
-    InternalLayer, Layer, Kernels, Shapes)
-
-
-from typing import Union, Tuple, Callable, Iterable, Dict, List, Optional
 
 # Enums
+
+
 class Padding(enum.Enum):
+  """Type of padding in pooling and convolutional layers."""
   CIRCULAR = 'CIRCULAR'
   SAME = 'SAME'
   VALID = 'VALID'
 
 
 class Pooling(enum.Enum):
+  """Type of pooling in pooling layers."""
   AVG = 'AVG'
   SUM = 'SUM'
 
@@ -145,47 +144,48 @@ def _requires(**static_reqs):
   Use this to specify your `kernel_fn` input kernel requirements.
   """
 
-  def req(kernel_fn):
+  def req(kernel_fn: LayerKernelFn):
     """Returns `kernel_fn` with additional consistency checks."""
 
     @utils.wraps(kernel_fn)
-    def new_kernel_fn(kernels, **user_reqs):
+    def new_kernel_fn(k: Kernels, **user_reqs) -> Kernels:
       """Executes `kernel_fn` on `kernels` after checking consistency."""
       fused_reqs = _fuse_reqs(static_reqs, {}, **user_reqs)
 
       # `FanInConcat / FanInSum` have no requirements and
       # execute custom consistency checks.
-      if not isinstance(kernels, list):
-        for k, v in fused_reqs.items():
+      if not isinstance(k, list):
+        for key, v in fused_reqs.items():
           if v is not None:  # `None` is treated as explicitly not having a req.
-            if k in ('diagonal_batch', 'diagonal_spatial'):
-              if getattr(kernels, k) and not v:
-                raise ValueError(f'{kernel_fn} requires `{k} == {v}`, but input'
-                                 f' kernel has `{k} == True`, hence does not '
-                                 f'contain sufficient information. Please '
-                                 f'recompute the input kernel with '
-                                 f'`{k} == {v}`.')
-            elif k in ('batch_axis', 'channel_axis'):
-              ndim = len(kernels.shape1)
-              v_kernel = getattr(kernels, k)
+            if key in ('diagonal_batch', 'diagonal_spatial'):
+              if getattr(k, key) and not v:
+                raise ValueError(f'{kernel_fn} requires `{key} == {v}`, but '
+                                 f'input kernel has `{key} == True`, hence '
+                                 f'does not contain sufficient information. '
+                                 f'Please recompute the input kernel with '
+                                 f'`{key} == {v}`.')
+            elif key in ('batch_axis', 'channel_axis'):
+              ndim = len(k.shape1)
+              v_kernel = getattr(k, key)
               v_pos = v % ndim
               if v_kernel != v_pos:
-                raise ValueError(f'{kernel_fn} requires `{k} == {v_pos}`, but '
-                                 f'input kernel has `{k} == {v_kernel}`, making'
-                                 f' the infinite limit ill-defined.')
+                raise ValueError(f'{kernel_fn} requires `{key} == {v_pos}`, '
+                                 f'but input kernel has `{key} == {v_kernel}`, '
+                                 f'making the infinite limit ill-defined.')
 
-            elif k == 'mask_constant':
+            elif key == 'mask_constant':
               pass
 
             else:
-              raise NotImplementedError(k)
+              raise NotImplementedError(key)
 
-      return kernel_fn(kernels)
+      return kernel_fn(k)
 
     setattr(new_kernel_fn, _INPUT_REQ, frozendict.frozendict(static_reqs))
     return new_kernel_fn
 
   return req
+
 
 def _supports_masking(remask_kernel: bool):
   """Returns a decorator that turns layers into layers supporting masking.
@@ -254,25 +254,25 @@ def _supports_masking(remask_kernel: bool):
           return outputs
         return utils.MaskedArray(outputs, outputs_mask)
 
-      def kernel_fn_with_masking(kernels, **user_reqs):
-        if isinstance(kernels, Kernel):
-          mask1 = mask_fn(kernels.mask1, kernels.shape1)
-          mask2 = mask_fn(kernels.mask2, kernels.shape2)
-        elif isinstance(kernels, list):
-          mask1 = mask_fn([k.mask1 for k in kernels],
-                          [k.shape1 for k in kernels])
-          mask2 = mask_fn([k.mask2 for k in kernels],
-                          [k.shape2 for k in kernels])
+      def kernel_fn_with_masking(k: Kernels, **user_reqs):
+        if isinstance(k, Kernel):
+          mask1 = mask_fn(k.mask1, k.shape1)
+          mask2 = mask_fn(k.mask2, k.shape2)
+        elif isinstance(k, list):
+          mask1 = mask_fn([k.mask1 for k in k],
+                          [k.shape1 for k in k])
+          mask2 = mask_fn([k.mask2 for k in k],
+                          [k.shape2 for k in k])
         else:
           raise TypeError(type(Kernel), Kernel)
 
-        kernels = kernel_fn(kernels, **user_reqs)
+        k = kernel_fn(k, **user_reqs)
 
         if remask_kernel:
-          kernels = kernels.mask(mask1, mask2)
+          k = k.mask(mask1, mask2)
         else:
-          kernels = kernels.replace(mask1=mask1, mask2=mask2)
-        return kernels
+          k = k.replace(mask1=mask1, mask2=mask2)
+        return k
 
       if hasattr(kernel_fn, _INPUT_REQ):
         setattr(kernel_fn_with_masking,
@@ -296,7 +296,7 @@ def serial(*layers: Layer, gen=False) -> InternalLayer:
   Based on `jax.experimental.stax.serial`.
 
   Args:
-    layers: a sequence of layers, each an `(init_fn, apply_fn, kernel_fn)`
+    *layers: a sequence of layers, each an `(init_fn, apply_fn, kernel_fn)`
       triple.
     :gen: bool, default `False`. Indicates whether the kernel_fn should return 
       a `Kernel` or a generator of `Kernel`s.
@@ -310,22 +310,22 @@ def serial(*layers: Layer, gen=False) -> InternalLayer:
 
   if gen is False:
     @_requires(**_get_input_req_attr(kernel_fns))
-    def kernel_fn(kernels):
+    def kernel_fn(k: Kernels) -> Kernels:
       for f in kernel_fns:
-        kernels = f(kernels)
-      return kernels
+        k = f(k)
+      return k
   else:
     @_requires(**_get_input_req_attr(kernel_fns))
-    def kernel_fn(kernels):
+    def kernel_fn(k: Kernels) -> Kernels:
       for f in kernel_fns:
-        kernels = f(kernels)
-        yield kernels
+        k = f(k)
+        yield k
 
   return init_fn, apply_fn, kernel_fn
 
 
 @layer
-def parallel(*layers: Iterable[Layer]) -> InternalLayer:
+def parallel(*layers: Layer) -> InternalLayer:
   """Combinator for composing layers in parallel.
 
   The layer resulting from this combinator is often used with the `FanOut` and
@@ -348,20 +348,21 @@ def parallel(*layers: Iterable[Layer]) -> InternalLayer:
     return list(init_fn_stax(rng, input_shape))
 
   @_requires(**_get_input_req_attr(kernel_fns))
-  def kernel_fn(kernels):
-    return [f(ker) for ker, f in zip(kernels, kernel_fns)]
+  def kernel_fn(ks: List[Kernel]) -> List[Kernel]:
+    return [f(k) for k, f in zip(ks, kernel_fns)]
 
   return init_fn, apply_fn, kernel_fn
 
 
 @layer
 @_supports_masking(remask_kernel=True)
-def Dense(out_dim: int,
-          W_std: float = 1.,
-          b_std: float = 0.,
-          parameterization: str = 'ntk',
-          batch_axis: int = 0,
-          channel_axis: int = -1) -> InternalLayer:
+def Dense(
+    out_dim: int,
+    W_std: float = 1.,
+    b_std: float = 0.,
+    parameterization: str = 'ntk',
+    batch_axis: int = 0,
+    channel_axis: int = -1) -> InternalLayer:
   r"""Layer constructor function for a dense (fully-connected) layer.
 
   Based on `jax.experimental.stax.Dense`.
@@ -369,21 +370,25 @@ def Dense(out_dim: int,
   Args:
     out_dim: The output feature / channel dimension. This is ignored in by the
       `kernel_fn` in NTK parameterization.
+
     W_std: Specifies the standard deviation of the weights.
+
     b_std: Specifies the standard deviation of the biases.
-    parameterization: Either 'ntk' or 'standard'.
+
+    parameterization: Either `"ntk"` or `"standard"`.
 
       Under ntk parameterization (https://arxiv.org/abs/1806.07572, page 3),
-      weights and biases are initialized as :math:`W_{ij} \sim N(0,1)`,
-      :math:`b_i \sim \mathcal{N}(0,1)`, and the finite width layer equation is
+      weights and biases are initialized as
+      :math:`W_{ij} \sim \mathcal{N}(0,1)`, :math:`b_i \sim \mathcal{N}(0,1)`,
+      and the finite width layer equation is
       :math:`z_i = \sigma_W / \sqrt{N} \sum_j W_{ij} x_j + \sigma_b b_i`.
 
       Under standard parameterization (https://arxiv.org/abs/2001.07301),
-      weights and biases are initialized as :math:`W_{ij} \sim \matchal{N}(0,
-      W_std^2/N)`,
+      weights and biases are initialized as :math:`W_{ij} \sim \mathcal{N}(0,
+      W_{std}^2/N)`,
       :math:`b_i \sim \mathcal{N}(0,\sigma_b^2)`, and the finite width layer
       equation is
-      :math:`z_i = \sum_j W_ij x_j + b_i`.
+      :math:`z_i = \sum_j W_{ij} x_j + b_i`.
 
     batch_axis: Specifies which axis is contains different elements of the
       batch. Defaults to `0`, the leading axis.
@@ -391,8 +396,11 @@ def Dense(out_dim: int,
     channel_axis: Specifies which axis contains the features / channels.
       Defaults to `-1`, the trailing axis. For `kernel_fn`, channel size is
       considered to be infinite.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
-  # TODO: after experimentation, evaluate whether to change default
+  # TODO(jaschasd): after experimentation, evaluate whether to change default
   # parameterization from "ntk" to "standard"
 
   parameterization = parameterization.lower()
@@ -401,9 +409,13 @@ def Dense(out_dim: int,
     _channel_axis = channel_axis % len(input_shape)
     output_shape = (input_shape[:_channel_axis] + (out_dim,)
                     + input_shape[_channel_axis + 1:])
-    k1, k2 = random.split(rng)
-    W = random.normal(k1, (input_shape[_channel_axis], out_dim))
-    b = random.normal(k2, (out_dim,))
+    rng1, rng2 = random.split(rng)
+    W = random.normal(rng1, (input_shape[_channel_axis], out_dim))
+
+    b_shape = [1] * len(input_shape)
+    b_shape[channel_axis] = out_dim
+    b = random.normal(rng2, b_shape)
+
     return output_shape, (W, b)
 
   def standard_init_fn(rng, input_shape):
@@ -416,7 +428,7 @@ def Dense(out_dim: int,
   elif parameterization == 'standard':
     init_fn = standard_init_fn
   else:
-    raise ValueError('Parameterization not supported: %s' % parameterization)
+    raise ValueError(f'Parameterization not supported: {parameterization}')
 
   def apply_fn(params, inputs, **kwargs):
     W, b = params
@@ -429,15 +441,14 @@ def Dense(out_dim: int,
     elif parameterization == 'standard':
       outputs = prod  + b
     else:
-      raise ValueError('Parameterization not supported: %s' % parameterization)
+      raise ValueError(f'Parameterization not supported: {parameterization}')
 
     return outputs
 
   @_requires(batch_axis=batch_axis, channel_axis=channel_axis)
-  def kernel_fn(kernels):
+  def kernel_fn(k: Kernel):
     """Compute the transformed kernels after a dense layer."""
-    cov1, nngp, cov2, ntk = \
-      kernels.cov1, kernels.nngp, kernels.cov2, kernels.ntk
+    cov1, nngp, cov2, ntk = k.cov1, k.nngp, k.cov2, k.ntk
 
     def fc(x):
       return _affine(x, W_std, b_std)
@@ -447,17 +458,17 @@ def Dense(out_dim: int,
       if ntk is not None:
         ntk = nngp + W_std**2 * ntk
     elif parameterization == 'standard':
-      input_width = kernels.shape1[channel_axis]
+      input_width = k.shape1[channel_axis]
       if ntk is not None:
         ntk = input_width * nngp + 1. + W_std**2 * ntk
       cov1, nngp, cov2 = map(fc, (cov1, nngp, cov2))
 
-    return kernels.replace(cov1=cov1,
-                           nngp=nngp,
-                           cov2=cov2,
-                           ntk=ntk,
-                           is_gaussian=True,
-                           is_input=False)
+    return k.replace(cov1=cov1,
+                     nngp=nngp,
+                     cov2=cov2,
+                     ntk=ntk,
+                     is_gaussian=True,
+                     is_input=False)
 
   def mask_fn(mask, input_shape):
     return np.all(mask, axis=channel_axis, keepdims=True)
@@ -467,14 +478,15 @@ def Dense(out_dim: int,
 
 @layer
 @_supports_masking(remask_kernel=True)
-def GeneralConv(dimension_numbers: Optional[Tuple[str, str, str]],
-                out_chan: int,
-                filter_shape: Tuple[int, ...],
-                strides: Tuple[int, ...] = None,
-                padding: str = Padding.VALID.name,
-                W_std: float = 1.0,
-                b_std: float = 0.0,
-                parameterization: str = 'ntk') -> InternalLayer:
+def GeneralConv(
+    dimension_numbers: Optional[Tuple[str, str, str]],
+    out_chan: int,
+    filter_shape: Tuple[int, ...],
+    strides: Tuple[int, ...] = None,
+    padding: str = Padding.VALID.name,
+    W_std: float = 1.0,
+    b_std: float = 0.0,
+    parameterization: str = 'ntk') -> InternalLayer:
   """Layer construction function for a general convolution layer.
 
   Based on `jax.experimental.stax.GeneralConv`.
@@ -489,13 +501,16 @@ def GeneralConv(dimension_numbers: Optional[Tuple[str, str, str]],
       with the number of spatial dimensions in `dimension_numbers`.
     strides: The stride of the convolution. The shape of the tuple should agree
       with the number of spatial dimensions in `dimension_nubmers`.
-    padding: Specifies padding for the convolution. Can be one of 'VALID',
-      'SAME', or 'CIRCULAR'. 'CIRCULAR' uses periodic convolutions.
+    padding: Specifies padding for the convolution. Can be one of `"VALID"`,
+      `"SAME"`, or `"CIRCULAR"`. `"CIRCULAR"` uses periodic convolutions.
     W_std: The standard deviation of the weights.
     b_std: The standard deviation of the biases.
-    parameterization: Either "ntk" or "standard". These parameterizations are
-      the direct analogues for convolution of the corresponding
+    parameterization: Either `"ntk"` or `"standard"`. These parameterizations
+      are the direct analogues for convolution of the corresponding
       parameterizations for `Dense` layers.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
   return _GeneralConv(dimension_numbers,
                       out_chan,
@@ -509,20 +524,19 @@ def GeneralConv(dimension_numbers: Optional[Tuple[str, str, str]],
 
 @layer
 @_supports_masking(remask_kernel=True)
-def Conv(out_chan: int,
-         filter_shape: Tuple[int, ...],
-         strides: Optional[Tuple[int, ...]] = None,
-         padding: str = Padding.VALID.name,
-         W_std: float = 1.0,
-         b_std: float = 0.0,
-         parameterization: str = 'ntk') -> InternalLayer:
+def Conv(
+    out_chan: int,
+    filter_shape: Tuple[int, ...],
+    strides: Optional[Tuple[int, ...]] = None,
+    padding: str = Padding.VALID.name,
+    W_std: float = 1.0,
+    b_std: float = 0.0,
+    parameterization: str = 'ntk') -> InternalLayer:
   """Layer construction function for a general convolution layer.
 
   Based on `jax.experimental.stax.Conv`.
 
   Args:
-    dimension_numbers: Specifies which axes should be convolved over. Should
-      match the specification in `jax.lax.dot_general_dilated`.
     out_chan: The number of output channels / features of the
       convolution. This is ignored in by the `kernel_fn` in NTK
       parameterization.
@@ -530,13 +544,16 @@ def Conv(out_chan: int,
       with the number of spatial dimensions in `dimension_numbers`.
     strides: The stride of the convolution. The shape of the tuple should agree
       with the number of spatial dimensions in `dimension_nubmers`.
-    padding: Specifies padding for the convolution. Can be one of 'VALID',
-      'SAME', or 'CIRCULAR'. 'CIRCULAR' uses periodic convolutions.
+    padding: Specifies padding for the convolution. Can be one of `"VALID"`,
+      `"SAME"`, or `"CIRCULAR"`. `"CIRCULAR"` uses periodic convolutions.
     W_std: The standard deviation of the weights.
     b_std: The standard deviation of the biases.
-    parameterization: Either "ntk" or "standard". These parameterizations are
-      the direct analogues for convolution of the corresponding
+    parameterization: Either `"ntk"` or `"standard"`. These parameterizations
+      are the direct analogues for convolution of the corresponding
       parameterizations for `Dense` layers.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
   return _GeneralConv(None,
                       out_chan,
@@ -548,14 +565,15 @@ def Conv(out_chan: int,
                       parameterization)
 
 
-def _GeneralConv(dimension_numbers: Optional[Tuple[str, str, str]],
-                 out_chan: int,
-                 filter_shape: Tuple[int, ...],
-                 strides: Optional[Tuple[int, ...]] = None,
-                 padding: str = Padding.VALID.name,
-                 W_std: float = 1.0,
-                 b_std: float = 0.0,
-                 parameterization: str = 'ntk') -> InternalLayer:
+def _GeneralConv(
+    dimension_numbers: Optional[Tuple[str, str, str]],
+    out_chan: int,
+    filter_shape: Tuple[int, ...],
+    strides: Optional[Tuple[int, ...]] = None,
+    padding: str = Padding.VALID.name,
+    W_std: float = 1.0,
+    b_std: float = 0.0,
+    parameterization: str = 'ntk') -> InternalLayer:
   """Layer construction function for a general convolution layer.
 
   Based on `jax.experimental.stax.GeneralConv`.
@@ -570,13 +588,16 @@ def _GeneralConv(dimension_numbers: Optional[Tuple[str, str, str]],
       with the number of spatial dimensions in `dimension_numbers`.
     strides: The stride of the convolution. The shape of the tuple should agree
       with the number of spatial dimensions in `dimension_nubmers`.
-    padding: Specifies padding for the convolution. Can be one of 'VALID',
-      'SAME', or 'CIRCULAR'. 'CIRCULAR' uses periodic convolutions.
+    padding: Specifies padding for the convolution. Can be one of `"VALID"`,
+      `"SAME"`, or `"CIRCULAR"`. `"CIRCULAR"` uses periodic convolutions.
     W_std: The standard deviation of the weights.
     b_std: The standard deviation of the biases.
-    parameterization: Either "ntk" or "standard". These parameterizations are
-      the direct analogues for convolution of the corresponding
+    parameterization: Either `"ntk"` or `"standard"`. These parameterizations
+      are the direct analogues for convolution of the corresponding
       parameterizations for `Dense` layers.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
 
   parameterization = parameterization.lower()
@@ -648,11 +669,10 @@ def _GeneralConv(dimension_numbers: Optional[Tuple[str, str, str]],
 
   @_requires(batch_axis=dimension_numbers[0].index('N'),
              channel_axis=dimension_numbers[0].index('C'))
-  def kernel_fn(kernels):
+  def kernel_fn(k: Kernel):
     """Compute the transformed kernels after a conv layer."""
-    cov1, nngp, cov2, ntk, is_reversed = (kernels.cov1, kernels.nngp,
-                                          kernels.cov2, kernels.ntk,
-                                          kernels.is_reversed)
+    cov1, nngp, cov2, ntk, is_reversed = (k.cov1, k.nngp, k.cov2, k.ntk,
+                                          k.is_reversed)
 
     input_spec = tuple(c for c in dimension_numbers[0] if c not in ('N', 'C'))
     conv_spec = tuple(c for c in dimension_numbers[1] if c not in ('I', 'O'))
@@ -663,7 +683,7 @@ def _GeneralConv(dimension_numbers: Optional[Tuple[str, str, str]],
     strides_kernel = tuple(strides[p] for p in
                            input_to_filter_permutation)
 
-    if kernels.diagonal_spatial:
+    if k.diagonal_spatial:
       def conv_unscaled(x, batch_ndim):
         x = _conv_kernel_diagonal_spatial(
             x, filter_shape_kernel, strides_kernel, padding, batch_ndim)
@@ -685,8 +705,8 @@ def _GeneralConv(dimension_numbers: Optional[Tuple[str, str, str]],
       x = conv_unscaled(x, batch_ndim)
       return _affine(x, W_std, b_std)
 
-    cov1 = conv(cov1, 1 if kernels.diagonal_batch else 2)
-    cov2 = conv(cov2, 1 if kernels.diagonal_batch else 2)
+    cov1 = conv(cov1, 1 if k.diagonal_batch else 2)
+    cov2 = conv(cov2, 1 if k.diagonal_batch else 2)
 
     if parameterization == 'ntk':
       nngp = conv(nngp, 2)
@@ -696,22 +716,22 @@ def _GeneralConv(dimension_numbers: Optional[Tuple[str, str, str]],
       nngp_unscaled = conv_unscaled(nngp, 2)
       if ntk is not None:
         ntk = (
-            input_total_dim(kernels.shape1) * nngp_unscaled + 1. +
-            W_std**2 * conv_unscaled(ntk, 2))
+            input_total_dim(k.shape1) * nngp_unscaled + 1. +
+            W_std ** 2 * conv_unscaled(ntk, 2))
       nngp = _affine(nngp_unscaled, W_std, b_std)
 
-    res = kernels.replace(cov1=cov1,
-                          nngp=nngp,
-                          cov2=cov2,
-                          ntk=ntk,
-                          is_gaussian=True,
-                          is_reversed=is_reversed,
-                          batch_axis=dimension_numbers[2].index('N'),
-                          channel_axis=dimension_numbers[2].index('C'),
-                          is_input=False)
+    res = k.replace(cov1=cov1,
+                    nngp=nngp,
+                    cov2=cov2,
+                    ntk=ntk,
+                    is_gaussian=True,
+                    is_reversed=is_reversed,
+                    batch_axis=dimension_numbers[2].index('N'),
+                    channel_axis=dimension_numbers[2].index('C'),
+                    is_input=False)
 
     # Reorder output spatial dimensions if the finite layer does so.
-    # TODO: make more efficient / lazy.
+    # TODO(romann): make more efficient / lazy.
     out_spec = tuple(c for c in dimension_numbers[2] if c not in ('N', 'C'))
     in_to_out_permutation = tuple(out_spec.index(c) for c in input_spec)
     res = res.transpose(in_to_out_permutation)
@@ -738,7 +758,7 @@ def FanOut(num: int) -> InternalLayer:
 
   This layer takes an input and produces `num` copies that can be fed into
   different branches of a neural network (for example with residual
-  sconnections).
+  connections).
 
   Args:
     num: The number of going edges to fan out into.
@@ -747,21 +767,23 @@ def FanOut(num: int) -> InternalLayer:
     `(init_fn, apply_fn, kernel_fn)`.
   """
   init_fn, apply_fn = ostax.FanOut(num)
-  kernel_fn = lambda kernels: [kernels] * num
+  kernel_fn = lambda k: [k] * num
   return init_fn, apply_fn, kernel_fn
 
 
 @layer
 @_supports_masking(remask_kernel=False)
-
 def FanInSum() -> InternalLayer:
   """Layer construction function for a fan-in sum layer.
 
   This layer takes a number of inputs (e.g. produced by `FanOut`) and sums the
   inputs to produce a single output.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
   init_fn, apply_fn = ostax.FanInSum
-  kernel_fn = lambda kernels: _fan_in_kernel_fn(kernels, None)
+  kernel_fn = lambda ks: _fan_in_kernel_fn(ks, None)
 
   def mask_fn(mask, input_shape):
     return _sum_masks(mask)
@@ -778,9 +800,12 @@ def FanInConcat(axis: int = -1) -> InternalLayer:
 
   Args:
     axis: Specifies the axis along which input tensors should be concatenated.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
   init_fn, apply_fn = ostax.FanInConcat(axis)
-  kernel_fn = lambda kernels: _fan_in_kernel_fn(kernels, axis)
+  kernel_fn = lambda ks: _fan_in_kernel_fn(ks, axis)
 
   def mask_fn(mask, input_shape):
     return _concat_masks(mask, input_shape, axis)
@@ -790,12 +815,13 @@ def FanInConcat(axis: int = -1) -> InternalLayer:
 
 @layer
 @_supports_masking(remask_kernel=True)
-def AvgPool(window_shape: Tuple[int, ...],
-            strides: Tuple[int, ...] = None,
-            padding: str = Padding.VALID.name,
-            normalize_edges: bool = True,
-            batch_axis: int = 0,
-            channel_axis: int = -1) -> InternalLayer:
+def AvgPool(
+    window_shape: Tuple[int, ...],
+    strides: Tuple[int, ...] = None,
+    padding: str = Padding.VALID.name,
+    normalize_edges: bool = True,
+    batch_axis: int = 0,
+    channel_axis: int = -1) -> InternalLayer:
   """Layer construction function for an average pooling layer.
 
   Based on `jax.experimental.stax.AvgPool`.
@@ -815,6 +841,9 @@ def AvgPool(window_shape: Tuple[int, ...],
     channel_axis: Specifies the channel / feature dimension. Defaults to `-1`,
       the trailing axis. For `kernel_fn`, channel size is considered to be
       infinite.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
   return _Pool(Pooling.AVG, window_shape, strides, padding, normalize_edges,
                batch_axis, channel_axis)
@@ -822,11 +851,12 @@ def AvgPool(window_shape: Tuple[int, ...],
 
 @layer
 @_supports_masking(remask_kernel=True)
-def SumPool(window_shape: Tuple[int, ...],
-            strides: Tuple[int, ...] = None,
-            padding: str = Padding.VALID.name,
-            batch_axis: int = 0,
-            channel_axis: int = -1) -> InternalLayer:
+def SumPool(
+    window_shape: Tuple[int, ...],
+    strides: Tuple[int, ...] = None,
+    padding: str = Padding.VALID.name,
+    batch_axis: int = 0,
+    channel_axis: int = -1) -> InternalLayer:
   """Layer construction function for a 2D sum pooling layer.
 
   Based on `jax.experimental.stax.SumPool`.
@@ -842,18 +872,22 @@ def SumPool(window_shape: Tuple[int, ...],
     channel_axis: Specifies the channel / feature dimension. Defaults to `-1`,
       the trailing axis. For `kernel_fn`, channel size is considered to be
       infinite.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
   return _Pool(Pooling.SUM, window_shape, strides, padding, False,
                batch_axis, channel_axis)
 
 
-def _Pool(pool_type: Pooling,
-          window_shape: Tuple[int, ...],
-          strides: Union[None, Tuple[int, ...]],
-          padding: str,
-          normalize_edges: bool,
-          batch_axis: int,
-          channel_axis: int) -> InternalLayer:
+def _Pool(
+    pool_type: Pooling,
+    window_shape: Tuple[int, ...],
+    strides: Union[None, Tuple[int, ...]],
+    padding: str,
+    normalize_edges: bool,
+    batch_axis: int,
+    channel_axis: int) -> InternalLayer:
   """Layer construction function for a 2D pooling layer.
 
   Based on `jax.experimental.stax.AvgPool` and `jax.experimental.stax.SumPool`.
@@ -875,6 +909,9 @@ def _Pool(pool_type: Pooling,
     channel_axis: Specifies the channel / feature dimension. Defaults to `-1`,
       the trailing axis. For `kernel_fn`, channel size is considered to be
       infinite.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
 
   strides = strides or (1,) * len(window_shape)
@@ -922,13 +959,12 @@ def _Pool(pool_type: Pooling,
   @_requires(batch_axis=batch_axis,
              channel_axis=channel_axis,
              diagonal_spatial=False)
-  def kernel_fn(kernels):
+  def kernel_fn(k: Kernel):
     """Kernel transformation."""
-    cov1, nngp, cov2, ntk = (kernels.cov1, kernels.nngp, kernels.cov2,
-                             kernels.ntk)
+    cov1, nngp, cov2, ntk = k.cov1, k.nngp, k.cov2, k.ntk
 
-    window_shape_kernel = window_shape[::(-1 if kernels.is_reversed else 1)]
-    strides_kernel = strides[::(-1 if kernels.is_reversed else 1)]
+    window_shape_kernel = window_shape[::(-1 if k.is_reversed else 1)]
+    strides_kernel = strides[::(-1 if k.is_reversed else 1)]
 
     nngp = _pool_kernel(nngp, pool_type, window_shape_kernel, strides_kernel,
                         padding, normalize_edges, 2)
@@ -936,15 +972,12 @@ def _Pool(pool_type: Pooling,
                        padding, normalize_edges, 2)
     cov1 = _pool_kernel(cov1, pool_type, window_shape_kernel, strides_kernel,
                         padding, normalize_edges,
-                        1 if kernels.diagonal_batch else 2)
+                        1 if k.diagonal_batch else 2)
     cov2 = _pool_kernel(cov2, pool_type, window_shape_kernel, strides_kernel,
                         padding, normalize_edges,
-                        1 if kernels.diagonal_batch else 2)
+                        1 if k.diagonal_batch else 2)
 
-    return kernels.replace(cov1=cov1,
-                           nngp=nngp,
-                           cov2=cov2,
-                           ntk=ntk)
+    return k.replace(cov1=cov1, nngp=nngp, cov2=cov2, ntk=ntk)
 
   def mask_fn(mask, input_shape):
     _check_is_implemented(mask, padding, channel_axis)
@@ -968,6 +1001,9 @@ def GlobalSumPool(batch_axis: int = 0, channel_axis: int = -1) -> InternalLayer:
     channel_axis: Specifies the channel / feature dimension. Defaults to `-1`,
       the trailing axis. For `kernel_fn`, channel size is considered to be
       infinite.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
   return _GlobalPool(Pooling.SUM, batch_axis, channel_axis)
 
@@ -986,12 +1022,17 @@ def GlobalAvgPool(batch_axis: int = 0, channel_axis: int = -1) -> InternalLayer:
     channel_axis: Specifies the channel / feature dimension. Defaults to `-1`,
       the trailing axis. For `kernel_fn`, channel size is considered to be
       infinite.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
   return _GlobalPool(Pooling.AVG, batch_axis, channel_axis)
 
 
 def _GlobalPool(
-    pool_type: Pooling, batch_axis: int, channel_axis: int) -> InternalLayer:
+    pool_type: Pooling,
+    batch_axis: int,
+    channel_axis: int) -> InternalLayer:
   """Layer construction function for a global pooling layer.
 
   Pools over and removes (`keepdims=False`) all spatial dimensions, preserving
@@ -1005,22 +1046,27 @@ def _GlobalPool(
     channel_axis: Specifies the channel / feature dimension. Defaults to `-1`,
       the trailing axis. For `kernel_fn`, channel size is considered to be
       infinite.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
 
   if pool_type == Pooling.AVG:
-    pool_fn = lambda x, axis, mask: _mean_and_var(x, axis, mask=mask)
+    pool_fn = lambda x, axis, mask: _mean_and_var(x, axis, mask=mask)[0]
   elif pool_type == Pooling.SUM:
     pool_fn = lambda x, axis, mask: np.sum(x, axis)
   else:
     raise ValueError(f'Invalid pooling type {pool_type}.')
 
   def init_fn(rng, input_shape):
-    non_spatial_axes = (batch_axis, channel_axis)
-    output_shape = tuple(input_shape[i] for i in non_spatial_axes)
+    ndim = len(input_shape)
+    non_spatial_axes = (batch_axis % ndim, channel_axis % ndim)
+    output_shape = tuple(input_shape[i] for i in range(ndim)
+                         if i in non_spatial_axes)
     return output_shape, ()
 
   def apply_fn(params, inputs, mask=None, **kwargs):
-    non_spatial_axes = (batch_axis, channel_axis % inputs.ndim)
+    non_spatial_axes = (batch_axis % inputs.ndim, channel_axis % inputs.ndim)
     spatial_axes = tuple(i for i in range(inputs.ndim)
                          if i not in non_spatial_axes)
     out = pool_fn(inputs, spatial_axes, mask)
@@ -1029,37 +1075,35 @@ def _GlobalPool(
   @_requires(batch_axis=batch_axis,
              channel_axis=channel_axis,
              diagonal_spatial=False)
-  def kernel_fn(kernels):
-    cov1, nngp, cov2, ntk = (kernels.cov1, kernels.nngp, kernels.cov2,
-                             kernels.ntk)
+  def kernel_fn(k: Kernel):
+    cov1, nngp, cov2, ntk = k.cov1, k.nngp, k.cov2, k.ntk
 
     def _pool(ker_mat, batch_ndim, mask=None):
-      if not utils.is_array(ker_mat):
+      if ker_mat is None:
         return ker_mat
       spatial_axes = tuple(range(batch_ndim, ker_mat.ndim))
       return pool_fn(ker_mat, axis=spatial_axes, mask=mask)
 
-    mask11, mask12, mask22 = kernels._get_mask_prods(kernels.mask1,
-                                                     kernels.mask2)
+    mask11, mask12, mask22 = k._get_mask_prods(k.mask1, k.mask2)
 
-    cov1 = _pool(cov1, 1 if kernels.diagonal_batch else 2, mask11)
-    cov2 = _pool(cov2, 1 if kernels.diagonal_batch else 2, mask22)
+    cov1 = _pool(cov1, 1 if k.diagonal_batch else 2, mask11)
+    cov2 = _pool(cov2, 1 if k.diagonal_batch else 2, mask22)
     nngp = _pool(nngp, 2, mask12)
     ntk = _pool(ntk, 2, mask12)
 
-    ndim = len(kernels.shape1)
+    ndim = len(k.shape1)
     batch_first = batch_axis % ndim < channel_axis % ndim
-    return kernels.replace(cov1=cov1,
-                           nngp=nngp,
-                           cov2=cov2,
-                           ntk=ntk,
-                           batch_axis=0 if batch_first else 1,
-                           channel_axis=1 if batch_first else 0,
-                           is_reversed=False)
+    return k.replace(cov1=cov1,
+                     nngp=nngp,
+                     cov2=cov2,
+                     ntk=ntk,
+                     batch_axis=0 if batch_first else 1,
+                     channel_axis=1 if batch_first else 0,
+                     is_reversed=False)
 
   def mask_fn(mask, input_shape):
     _check_is_implemented(mask, None, channel_axis)
-    non_spatial_axes = (batch_axis, channel_axis % mask.ndim)
+    non_spatial_axes = (batch_axis % mask.ndim, channel_axis % mask.ndim)
     spatial_axes = tuple(i for i in range(mask.ndim)
                          if i not in non_spatial_axes)
     return np.all(mask, spatial_axes)
@@ -1075,11 +1119,13 @@ def Flatten(batch_axis: int = 0, batch_axis_out: int = 0) -> InternalLayer:
   Based on `jax.experimental.stax.Flatten`, but allows to specify batch axes.
 
   Args:
-    batch_axis: Specifies the batch dimension. Defaults to `0`, the leading
-      axis.
-    channel_axis: Specifies the channel / feature dimension. Defaults to `-1`,
-      the trailing axis. For `kernel_fn`, channel size is considered to be
-      infinite.
+    batch_axis: Specifies the input batch dimension. Defaults to `0`, the
+      leading axis.
+    batch_axis_out: Specifies the output batch dimension. Defaults to `0`, the
+      leading axis.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
   if batch_axis_out in (0, -2):
     batch_axis_out = 0
@@ -1095,12 +1141,13 @@ def Flatten(batch_axis: int = 0, batch_axis_out: int = 0) -> InternalLayer:
     batch_size = input_shape[batch_axis]
     channel_size = functools.reduce(
         op.mul,
-        input_shape[:batch_axis] + input_shape[batch_axis + 1:],
+        input_shape[:batch_axis] + input_shape[(batch_axis + 1)
+                                               or len(input_shape):],
         1
     )
     if batch_axis_out == 0:
-      return (batch_size, channel_size)
-    return (channel_size, batch_size)
+      return batch_size, channel_size
+    return channel_size, batch_size
 
   def init_fn(rng, input_shape):
     output_shape = get_output_shape(input_shape)
@@ -1108,22 +1155,21 @@ def Flatten(batch_axis: int = 0, batch_axis_out: int = 0) -> InternalLayer:
 
   def apply_fn(params, inputs, **kwargs):
     output_shape = get_output_shape(inputs.shape)
-    inputs = np.moveaxis(inputs, batch_axis, batch_axis_out)
+    inputs = np.moveaxis(inputs, batch_axis, -batch_axis_out)
     return inputs.reshape(output_shape)
 
   @_requires(batch_axis=batch_axis,
              channel_axis=None,
              diagonal_spatial=True)
-  def kernel_fn(kernels):
+  def kernel_fn(k: Kernel):
     """Compute kernels."""
-    cov1, nngp, cov2, ntk = (kernels.cov1, kernels.nngp, kernels.cov2,
-                             kernels.ntk)
+    cov1, nngp, cov2, ntk = k.cov1, k.nngp, k.cov2, k.ntk
 
     def trace(x, batch_ndim):
-      if not utils.is_array(x):
+      if x is None:
         return x
 
-      if kernels.diagonal_spatial:
+      if k.diagonal_spatial:
         spatial_axes = tuple(range(x.ndim)[batch_ndim:])
         x = np.mean(x, spatial_axes)
 
@@ -1133,20 +1179,20 @@ def Flatten(batch_axis: int = 0, batch_axis_out: int = 0) -> InternalLayer:
 
       return x
 
-    cov1 = trace(cov1, 1 if kernels.diagonal_batch else 2)
-    cov2 = trace(cov2, 1 if kernels.diagonal_batch else 2)
+    cov1 = trace(cov1, 1 if k.diagonal_batch else 2)
+    cov2 = trace(cov2, 1 if k.diagonal_batch else 2)
     nngp = trace(nngp, 2)
     ntk = trace(ntk, 2)
 
-    return kernels.replace(cov1=cov1,
-                           nngp=nngp,
-                           cov2=cov2,
-                           ntk=ntk,
-                           is_gaussian=False,
-                           is_reversed=False,
-                           batch_axis=batch_axis_out,
-                           channel_axis=channel_axis_out,
-                           diagonal_spatial=False)
+    return k.replace(cov1=cov1,
+                     nngp=nngp,
+                     cov2=cov2,
+                     ntk=ntk,
+                     is_gaussian=False,
+                     is_reversed=False,
+                     batch_axis=batch_axis_out,
+                     channel_axis=channel_axis_out,
+                     diagonal_spatial=False)
 
   def mask_fn(mask, input_shape):
     mask = np.broadcast_to(mask, input_shape)
@@ -1162,24 +1208,106 @@ def Identity() -> InternalLayer:
   """Layer construction function for an identity layer.
 
   Based on `jax.experimental.stax.Identity`.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
   init_fn, apply_fn = ostax.Identity
-  kernel_fn = lambda kernels: kernels
+  kernel_fn = lambda k: k
   return init_fn, apply_fn, kernel_fn
 
 
 @layer
 @_supports_masking(remask_kernel=True)
-def Erf(do_backprop: bool = False) -> InternalLayer:
+def Erf(a: float = 1.,
+        b: float = 1.,
+        c: float = 0.,
+        do_backprop: bool = False) -> InternalLayer:
+  """Affine transform of `Erf` nonlinearity, i.e. `a Erf(b * x) + c`.
+  Args:
+    a: a float.
+    b: a float.
+    c: a float.
+    do_backprop: set to `True` if you want to backpropagate through the kernel.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
+  """
   return _elementwise(_erf,
                       'Erf',
+                      a=a,
+                      b=b,
+                      c=c,
                       do_backprop=do_backprop)
 
 
 @layer
 @_supports_masking(remask_kernel=True)
+def Gelu(do_backprop: bool = False) -> InternalLayer:
+  """Gelu function.
+
+  Args:
+    do_backprop: set to `True` if you want to backpropagate through the kernel.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
+  """
+  return _elementwise(_gelu,
+                      'Gelu',
+                      do_backprop=do_backprop)
+
+
+@layer
+@_supports_masking(remask_kernel=True)
+def Sin(a: float = 1.,
+        b: float = 1.,
+        c: float = 0.) -> InternalLayer:
+  """Affine transform of `Sin` nonlinearity, i.e. `a sin(b*x + c)`
+
+  Args:
+    a: a float.
+    b: a float.
+    c: a float.
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
+  """
+  return _elementwise(_sin, 'Sin', a=a, b=b, c=c)
+
+
+@layer
+@_supports_masking(remask_kernel=True)
+def Rbf(gamma: float = 1.0) -> InternalLayer:
+  """Returns the dual activation function layer for normalized RBF or sqaured exponential kernel.
+
+  Dual activation function is `f(x) = sqrt(2)*sin(sqrt(2*gamma) x + pi/4)`.
+
+  NNGP kernel transformation correspond to (with input dimension `d`)
+    `k = exp(- gamma / d * ||x - x'||^2) = exp(- gamma*(q11 + q22 - 2 * q12))`.
+
+  Args:
+    gamma: related to characteristic length-scale (l) that controls width of
+      the kernel, where `gamma = 1 / (2 l^2)`.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
+  """
+  return _elementwise(_rbf, 'Rbf', gamma=gamma)
+
+
+@layer
+@_supports_masking(remask_kernel=True)
 def Relu(
-    do_backprop: bool = False, do_stabilize: bool = False) -> InternalLayer:
+    do_backprop: bool = False,
+    do_stabilize: bool = False) -> InternalLayer:
+  """ReLU nonlinearity.
+
+  Args:
+    do_backprop: set to `True` if you want to backpropagate through the kernel.
+    do_stabilize: set to `True` for very deep networks.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
+  """
   return _elementwise(_ab_relu,
                       'ReLU',
                       a=0,
@@ -1190,10 +1318,22 @@ def Relu(
 
 @layer
 @_supports_masking(remask_kernel=True)
-def ABRelu(a: float,
-           b: float,
-           do_backprop: bool=False,
-           do_stabilize: bool=False) -> InternalLayer:
+def ABRelu(
+    a: float,
+    b: float,
+    do_backprop: bool = False,
+    do_stabilize: bool = False) -> InternalLayer:
+  """ABReLU nonlinearity, i.e. `a * min(x, 0) + b * max(x, 0)`.
+
+  Args:
+    a: slope for `x < 0`.
+    b: slope for `x > 0`.
+    do_backprop: set to `True` if you want to backpropagate through the kernel.
+    do_stabilize: set to `True` for very deep networks.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
+  """
   return _elementwise(_ab_relu,
                       f'ABReLU({a}, {b})',
                       a=a,
@@ -1208,6 +1348,16 @@ def LeakyRelu(
     alpha: float,
     do_backprop: bool = False,
     do_stabilize: bool = False) -> InternalLayer:
+  """Leaky ReLU nonlinearity, i.e. `alpha * min(x, 0) + max(x, 0)`.
+
+  Args:
+    alpha: slope for `x < 0`.
+    do_backprop: set to `True` if you want to backpropagate through the kernel.
+    do_stabilize: set to `True` for very deep networks.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
+  """
   return _elementwise(_ab_relu,
                       f'LeakyReLU({alpha})',
                       a=alpha,
@@ -1219,6 +1369,15 @@ def LeakyRelu(
 @layer
 @_supports_masking(remask_kernel=True)
 def Abs(do_backprop: bool = False, do_stabilize: bool = False) -> InternalLayer:
+  """Absolute value nonlinearity.
+
+  Args:
+    do_backprop: set to `True` if you want to backpropagate through the kernel.
+    do_stabilize: set to `True` for very deep networks.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
+  """
   return _elementwise(_ab_relu,
                       'Abs',
                       a=-1,
@@ -1229,18 +1388,19 @@ def Abs(do_backprop: bool = False, do_stabilize: bool = False) -> InternalLayer:
 
 @layer
 @_supports_masking(remask_kernel=True)
-def GlobalSelfAttention(n_chan_out: int,
-                        n_chan_key: int,
-                        n_chan_val: int,
-                        n_heads: int,
-                        fixed: bool = True,
-                        W_key_std: float = 1.0,
-                        W_value_std: float = 1.0,
-                        W_query_std: float = 1.0,
-                        W_out_std: float = 1.0,
-                        b_std: float = 0.0,
-                        batch_axis: int = 0,
-                        channel_axis: int = -1) -> InternalLayer:
+def GlobalSelfAttention(
+    n_chan_out: int,
+    n_chan_key: int,
+    n_chan_val: int,
+    n_heads: int,
+    fixed: bool = True,
+    W_key_std: float = 1.0,
+    W_value_std: float = 1.0,
+    W_query_std: float = 1.0,
+    W_out_std: float = 1.0,
+    b_std: float = 0.0,
+    batch_axis: int = 0,
+    channel_axis: int = -1) -> InternalLayer:
   """Scaled dot-product self-attention with multiple attention heads.
 
   Two versions of attention are available (the version to be used is
@@ -1250,6 +1410,7 @@ def GlobalSelfAttention(n_chan_out: int,
   the dot product between keys and queries is scaled by the squared root
   of their dimension. The expression for `nngp`/`ntk` involves an integral
   with no known closed form and thus call to `kernel_fn` results in an error.
+
   2. Fixed: same as Parametric except for scaling the dot products
   between keys and queries by their dimension instead of the square root
   of the same quantity, and tying the key and query weight matrices.
@@ -1263,7 +1424,7 @@ def GlobalSelfAttention(n_chan_out: int,
   The final computation for single head is then
   :math:`f_h (x) + softmax(<scaling> Q(x) K(x)^T) V(x)`
   and the output of this layer is computed as
-  :math:`f(x) = concat[f_1(x) , ... , f_<n_{heads}> (x)] W_out + b`
+  :math:`f(x) = concat[f_1(x) , ... , f_{<n_{heads}>} (x)] W_{out} + b`
   where the shape of of `b` is `(n_chan_out,)`, i.e., single bias per channel
 
   The `kernel_fn` computes the limiting kernel of the outputs of this layer
@@ -1279,23 +1440,27 @@ def GlobalSelfAttention(n_chan_out: int,
       scaled by `1 / n_chan_key` and the key and query weight matrices are tied;
       if `False`, the dot products are scaled by `1 / sqrt(n_chan_key)` and
       the key and query matrices are independent.
-    W_out_std: Initial standard deviation of the output weights values.
-    b_std: Initial standard deviation of the bias values.
-    W_value_std: init standard deviation of the key weights values.
     W_key_std: init standard deviation of the key weights values.
+    W_value_std: init standard deviation of the key weights values.
     W_query_std: init standard deviation of the query weights values; if
       `fixed` is `True` (and thus key and query weights are tied---see above)
       then keys are computed with `WK = WK_std * W / sqrt(n_chan_in)` and the
       queries are computed with `WQ = W_query_std * W / sqrt(n_chan_in)` weight
       matrices
+    W_out_std: Initial standard deviation of the output weights values.
+    b_std: Initial standard deviation of the bias values.
     batch_axis: Specifies the batch dimension. Defaults to `0`, the leading
       axis.
     channel_axis: Specifies the channel / feature dimension. Defaults to `-1`,
       the trailing axis. For `kernel_fn`, channel size is considered to be
       infinite.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
+
   Raises:
     NotImplementedError: If `fixed` is `False`, call to `kernel_fn` will result
-    in an error as there is no known analytic expression for the kernel.
+      in an error as there is no known analytic expression for the kernel.
   """
 
   OV_gain = W_out_std * W_value_std
@@ -1314,7 +1479,10 @@ def GlobalSelfAttention(n_chan_out: int,
     key_matrices = rand(rng_K, shape=(n_heads, n_chan_in, n_chan_key))
     val_matrices = rand(rng_V, shape=(n_heads, n_chan_in, n_chan_val))
     W_out = rand(rng_O, shape=(n_chan_val * n_heads, n_chan_out))
-    b = rand(rng_b, shape=(n_chan_out,))
+
+    b_shape = [1] * len(input_shape)
+    b_shape[_channel_axis] = n_chan_out
+    b = rand(rng_b, shape=b_shape)
 
     if fixed:
       query_matrices = None
@@ -1364,29 +1532,28 @@ def GlobalSelfAttention(n_chan_out: int,
     heads = np.reshape(heads, heads.shape[:-2] + (-1,))
 
     ret = np.matmul(heads, W_out_std * W_out / np.sqrt(n_chan_val * n_heads))
-    ret = np.reshape(ret, (n,) + spatial_shape + (n_chan_out,)) + b_std * b
-    ret = np.moveaxis(ret, (0, -1), (batch_axis, _channel_axis))
+    ret = np.reshape(ret, (n,) + spatial_shape + (n_chan_out,))
+    ret = np.moveaxis(ret, (0, -1), (batch_axis, _channel_axis)) + b_std * b
     return ret
 
   @_requires(batch_axis=batch_axis,
              channel_axis=channel_axis,
              diagonal_spatial=False)
-  def kernel_fn(kernels):
-    cov1, nngp, cov2, ntk = (kernels.cov1, kernels.nngp, kernels.cov2,
-                             kernels.ntk)
+  def kernel_fn(k: Kernel):
+    cov1, nngp, cov2, ntk = k.cov1, k.nngp, k.cov2, k.ntk
 
     if not fixed:
       raise NotImplementedError('No known closed form expression.')
 
     def _get_G_softmax(mat, mask):
-      if not kernels.diagonal_batch:
+      if not k.diagonal_batch:
         mat = np.moveaxis(np.diagonal(mat, axis1=0, axis2=1), -1, 0)
 
       if mask is not None:
         mask = np.all(mask, axis=channel_axis, keepdims=True)
         mask = np.moveaxis(mask, (batch_axis, channel_axis), (0, -1))
         mask = np.squeeze(mask, axis=-1)
-        if kernels.is_reversed:
+        if k.is_reversed:
           mask = np.moveaxis(mask, range(1, mask.ndim),
                              range(mask.ndim -1, 0, -1))
         mask = utils.interleave_ones(mask, 1, mask.ndim, False)
@@ -1396,7 +1563,7 @@ def GlobalSelfAttention(n_chan_out: int,
       return ostax.softmax(QK_gain * mat, axis=axes[2::2])
 
     def _transform_kernel(mat, G1, G2=None):
-      if not utils.is_array(mat):
+      if mat is None or mat.ndim == 0:
         return mat
 
       G2 = G1 if G2 is None else G2
@@ -1423,8 +1590,8 @@ def GlobalSelfAttention(n_chan_out: int,
                       optimize=True)
       return _affine(res, OV_gain, b_std)
 
-    G1 = _get_G_softmax(cov1, kernels.mask1)
-    G2 = _get_G_softmax(cov2, kernels.mask2) if cov2 is not None else G1
+    G1 = _get_G_softmax(cov1, k.mask1)
+    G2 = _get_G_softmax(cov2, k.mask2) if cov2 is not None else G1
 
     cov1 = _transform_kernel(cov1, G1)
     cov2 = _transform_kernel(cov2, G2) if cov2 is not None else cov2
@@ -1432,11 +1599,7 @@ def GlobalSelfAttention(n_chan_out: int,
     ntk = (_transform_kernel(ntk, G1, G2) + 2 * (nngp - b_std**2)
            if ntk is not None else ntk)
 
-    return kernels.replace(cov1=cov1,
-                           nngp=nngp,
-                           cov2=cov2,
-                           ntk=ntk,
-                           is_gaussian=True)
+    return k.replace(cov1=cov1, nngp=nngp, cov2=cov2, ntk=ntk, is_gaussian=True)
 
   def mask_fn(mask, input_shape):
     return np.all(mask, channel_axis, keepdims=True)
@@ -1447,7 +1610,7 @@ def GlobalSelfAttention(n_chan_out: int,
 @layer
 @_supports_masking(remask_kernel=False)
 def LayerNorm(
-    axis: int = -1,
+    axis: Axes = -1,
     eps: float = 1e-12,
     batch_axis: int = 0,
     channel_axis: int = -1) -> InternalLayer:
@@ -1462,6 +1625,9 @@ def LayerNorm(
     channel_axis: Specifies the channel / feature dimension. Defaults to `-1`,
       the trailing axis. For `kernel_fn`, channel size is considered to be
       infinite.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
   def init_fn(rng, input_shape):
     return input_shape, ()
@@ -1473,18 +1639,17 @@ def LayerNorm(
     return (inputs - mean) / np.sqrt(eps + var)
 
   @_requires(batch_axis=batch_axis, channel_axis=channel_axis)
-  def kernel_fn(kernels):
-    cov1, nngp, cov2, ntk = (kernels.cov1, kernels.nngp, kernels.cov2,
-                             kernels.ntk)
+  def kernel_fn(k: Kernel):
+    cov1, nngp, cov2, ntk = k.cov1, k.nngp, k.cov2, k.ntk
 
-    if not kernels.is_gaussian:
+    if not k.is_gaussian:
       raise NotImplementedError('LayerNorm only implemented for Gaussian '
                                 'inputs.')
 
-    ndim = len(kernels.shape1)
+    ndim = len(k.shape1)
     _channel_axis = channel_axis % ndim
     _batch_axis = batch_axis % ndim
-    _axis = list(utils.canonicalize_axis(axis, kernels.shape1))
+    _axis = utils.canonicalize_axis(axis, k.shape1)
 
     if _channel_axis not in _axis:
       raise ValueError(f'Normalisation over channels (axis {_channel_axis})'
@@ -1493,7 +1658,7 @@ def LayerNorm(
 
     _axis.remove(_channel_axis)
 
-    spatial_axes = tuple(i for i in range(len(kernels.shape1))
+    spatial_axes = tuple(i for i in range(len(k.shape1))
                          if i not in (_channel_axis, batch_axis))
 
     # Batch axis
@@ -1505,7 +1670,7 @@ def LayerNorm(
 
     # Spatial axes
     kernel_axis += tuple(
-        1 + spatial_axes[::(-1 if kernels.is_reversed else 1)].index(i)
+        1 + spatial_axes[::(-1 if k.is_reversed else 1)].index(i)
         for i in _axis)
 
     # Prepare masks for normalization
@@ -1518,34 +1683,32 @@ def LayerNorm(
                                   'not implemented in the infinite limit.')
 
       m = np.squeeze(m, channel_axis)
-      if kernels.is_reversed:
+      if k.is_reversed:
         m = np.moveaxis(m, range(1, m.ndim), range(m.ndim - 1, 0, -1))
 
       return m
 
-    prod11, prod12, prod22 = _get_diagonal_prods(
+    prod11, prod12, prod22 = _get_diagonal_outer_prods(
         eps + cov1,
         cov2 if cov2 is None else eps + cov2,
-        kernels.diagonal_batch,
-        kernels.diagonal_spatial,
+        k.diagonal_batch,
+        k.diagonal_spatial,
+        op.mul,
         axis=kernel_axis,
-        mask1=prepare_mask(kernels.mask1),
-        mask2=prepare_mask(kernels.mask2),
+        mask1=prepare_mask(k.mask1),
+        mask2=prepare_mask(k.mask2),
     )
 
     nngp /= np.sqrt(prod12)
 
-    if utils.is_array(ntk):
+    if ntk is not None:
       ntk /= np.sqrt(prod12)
 
     cov1 /= np.sqrt(prod11)
     if cov2 is not None:
       cov2 /= np.sqrt(prod22)
 
-    return kernels.replace(cov1=cov1,
-                           nngp=nngp,
-                           cov2=cov2,
-                           ntk=ntk)
+    return k.replace(cov1=cov1, nngp=nngp, cov2=cov2, ntk=ntk)
 
   return init_fn, apply_fn, kernel_fn
 
@@ -1561,6 +1724,9 @@ def Dropout(rate: float, mode: str = 'train') -> InternalLayer:
     rate: Specifies the keep `rate`, e.g. `rate=1` is equivalent to
       keeping all neurons.
     mode: Either `train` or `test`.
+
+  Returns:
+    `(init_fn, apply_fn, kernel_fn)`.
   """
   if mode not in ('test', 'train'):
     raise ValueError('The `mode` must be either "test"  or "train".')
@@ -1570,31 +1736,30 @@ def Dropout(rate: float, mode: str = 'train') -> InternalLayer:
   init_fn, apply_fn = ostax.Dropout(rate, mode=mode)
   kernel_fn_test = lambda kernels: kernels
 
-  def kernel_fn_train(kernels):
-    """kernel_fn for `train` mode. """
-    cov1, nngp, cov2, ntk = (kernels.cov1, kernels.nngp, kernels.cov2,
-                             kernels.ntk)
+  def kernel_fn_train(k: Kernel):
+    """kernel_fn for `train` mode."""
+    cov1, nngp, cov2, ntk = k.cov1, k.nngp, k.cov2, k.ntk
 
-    if kernels.is_input:
+    if k.is_input:
       raise ValueError('Dropout cannot be applied to the input layer.')
 
     factor = 1./rate
 
-    cov1 = _diag_mul(cov1, factor, kernels.diagonal_batch,
-                     kernels.diagonal_spatial)
-    cov2 = _diag_mul(cov2, factor, kernels.diagonal_batch,
-                     kernels.diagonal_spatial)
+    cov1 = _diag_mul(cov1, factor, k.diagonal_batch,
+                     k.diagonal_spatial)
+    cov2 = _diag_mul(cov2, factor, k.diagonal_batch,
+                     k.diagonal_spatial)
 
-    new_factor = np.where(kernels.x1_is_x2, factor, 1.)
-    nngp = _diag_mul(nngp, new_factor, False, kernels.diagonal_spatial)
-    ntk = _diag_mul(ntk, new_factor, False, kernels.diagonal_spatial)
+    new_factor = np.where(k.x1_is_x2, factor, 1.)
+    nngp = _diag_mul(nngp, new_factor, False, k.diagonal_spatial)
+    ntk = _diag_mul(ntk, new_factor, False, k.diagonal_spatial)
 
-    # TODO: under which condition could we leave `is_gaussian` unchanged?
-    return kernels.replace(cov1=cov1,
-                           nngp=nngp,
-                           cov2=cov2,
-                           ntk=ntk,
-                           is_gaussian=False)
+    # TODO(xlc): under which condition could we leave `is_gaussian` unchanged?
+    return k.replace(cov1=cov1,
+                     nngp=nngp,
+                     cov2=cov2,
+                     ntk=ntk,
+                     is_gaussian=False)
 
   kernel_fn = kernel_fn_test if mode == 'test' else kernel_fn_train
 
@@ -1656,25 +1821,28 @@ def _double_tuple(x):
   return tuple(v for v in x for _ in range(2))
 
 
-def _size_at(x: np.ndarray, axis: Iterable[int]):
-  return functools.reduce(op.mul, (x.shape[i] for i in axis), 1)
-
-
-def _cov_diag_batch_diag_spatial(x, batch_axis, channel_axis):
+def _cov_diag_batch_diag_spatial(x: np.ndarray,
+                                 batch_axis: int,
+                                 channel_axis: int) -> np.ndarray:
   ret = np.sum(x ** 2, axis=channel_axis)
   new_batch_axis = batch_axis - (1 if batch_axis > channel_axis else 0)
   ret = np.moveaxis(ret, new_batch_axis, 0)
   return ret
 
 
-def _cov_diag_batch_full_spatial(x, batch_axis, channel_axis):
+def _cov_diag_batch_full_spatial(x: np.ndarray,
+                                 batch_axis: int,
+                                 channel_axis: int) -> np.ndarray:
   x = np.moveaxis(x, (batch_axis, channel_axis), (0, -1))
   ret = lax.dot_general(x, x, (((x.ndim - 1,), (x.ndim - 1,)), ((0,), (0,))))
   ret = utils.zip_axes(ret, 1)
   return ret
 
 
-def _cov_full_batch_full_spatial(x1, x2, batch_axis, channel_axis):
+def _cov_full_batch_full_spatial(x1: np.ndarray,
+                                 x2: np.ndarray,
+                                 batch_axis: int,
+                                 channel_axis: int) -> np.ndarray:
   ret = np.tensordot(x1, x2, (channel_axis, channel_axis))
   new_batch_axis = batch_axis - (1 if batch_axis > channel_axis else 0)
   ret = np.moveaxis(ret, (new_batch_axis, x1.ndim - 1 + new_batch_axis), (0, 1))
@@ -1682,14 +1850,20 @@ def _cov_full_batch_full_spatial(x1, x2, batch_axis, channel_axis):
   return ret
 
 
-def _cov_full_batch_diag_spatial(x1, x2, batch_axis, channel_axis):
+def _cov_full_batch_diag_spatial(x1: np.ndarray,
+                                 x2: np.ndarray,
+                                 batch_axis: int,
+                                 channel_axis: int) -> np.ndarray:
   ret = np.matmul(np.moveaxis(x1, (batch_axis, channel_axis), (-2, -1)),
                   np.moveaxis(x2, (batch_axis, channel_axis), (-1, -2)))
   ret = np.moveaxis(ret, (-2, -1), (0, 1))
   return ret
 
 
-def _cov_diagonal_batch(x, diagonal_spatial, batch_axis, channel_axis):
+def _cov_diagonal_batch(x: np.ndarray,
+                        diagonal_spatial: bool,
+                        batch_axis: int,
+                        channel_axis: int) -> np.ndarray:
   if diagonal_spatial:
     ret = _cov_diag_batch_diag_spatial(x, batch_axis, channel_axis)
   else:
@@ -1699,11 +1873,11 @@ def _cov_diagonal_batch(x, diagonal_spatial, batch_axis, channel_axis):
 
 def _cov(
     x1: np.ndarray,
-    x2: np.ndarray,
+    x2: Optional[np.ndarray],
     diagonal_spatial: bool,
     batch_axis: int,
-    channel_axis: int) -> np.ndarray:
-  """Computes uncentred covariance (nngp) between two batches of inputs.
+    channel_axis: int) -> Optional[np.ndarray]:
+  """Computes uncentered covariance (nngp) between two batches of inputs.
 
   Args:
     x1: a (2+S)D (S >= 0) `np.ndarray` of shape
@@ -1742,18 +1916,19 @@ def _cov(
   return ret / x1.shape[channel_axis]
 
 
-def _inputs_to_kernel(x1: np.ndarray,
-                      x2: Optional[np.ndarray],
-                      diagonal_batch: bool,
-                      diagonal_spatial: bool,
-                      compute_ntk: bool,
-                      batch_axis: int,
-                      channel_axis: int,
-                      mask_constant: Optional[float],
-                      eps: float = 1e-12) -> Kernel:
+def _inputs_to_kernel(
+    x1: np.ndarray,
+    x2: Optional[np.ndarray],
+    diagonal_batch: bool,
+    diagonal_spatial: bool,
+    compute_ntk: bool,
+    batch_axis: int,
+    channel_axis: Optional[int],
+    mask_constant: Optional[float],
+    eps: float = 1e-12) -> Kernel:
   """Transforms (batches of) inputs to a `Kernel`.
 
-  This is a private method. Docstring and example are for internal reference.
+  This is a private function. Docstring and example are for internal reference.
 
   The kernel contains the empirical covariances between different inputs and
   their entries (e.g. pixels, words, entries in a time series etc.) necessary
@@ -1764,6 +1939,35 @@ def _inputs_to_kernel(x1: np.ndarray,
   all networks are assumed to have i.i.d. weights along the channel / feature
   / logits dimensions, hence covariance between different entries along these
   dimensions is known to be 0 and is not tracked.
+
+  Example:
+    >>> x = np.ones((10, 32, 16, 3))
+    >>> o = _inputs_to_kernel(x, None,
+    >>>                       diagonal_batch=True,
+    >>>                       diagonal_spatial=False,
+    >>>                       compute_ntk=True,
+    >>>                       batch_axis=0,
+    >>>                       channel_axis=-1)
+    >>> o.cov1.shape, o.ntk.shape
+    (10, 32, 32, 16, 16), (10, 10, 32, 32, 16, 16)
+    >>> o = _inputs_to_kernel(x, None,
+    >>>                       diagonal_batch=True,
+    >>>                       diagonal_spatial=True,
+    >>>                       compute_ntk=True,
+    >>>                       batch_axis=0,
+    >>>                       channel_axis=-1)
+    >>> o.cov1.shape, o.ntk.shape
+    (10, 32, 16), (10, 10, 32, 16)
+    >>> x1 = np.ones((10, 128))
+    >>> x2 = np.ones((20, 128))
+    >>> o = _inputs_to_kernel(x1, x2,
+    >>>                       diagonal_batch=True,
+    >>>                       diagonal_spatial=True,
+    >>>                       compute_ntk=False,
+    >>>                       batch_axis=0,
+    >>>                       channel_axis=-1)
+    >>> o.cov1.shape, o.nngp.shape
+    (10,), (10, 20)
 
   Args:
     x1: an `(S+2)`-dimensional `np.ndarray` of shape
@@ -1793,43 +1997,22 @@ def _inputs_to_kernel(x1: np.ndarray,
     batch_axis: Specifies which axis is the batch axis.
     channel_axis: Specifies which axis is the channel / feature axis.
       For `kernel_fn`, channel size is considered to be infinite.
-    eps: a small number used to check whether x1 and x2 are the same up to
-        `eps`.
-    :mask_constant: an optional `float`, the value in inputs to be considered as
+    mask_constant: an optional `float`, the value in inputs to be considered as
       masked (e.g. padding in a batch of sentences). `None` means no masking.
       Can also be `np.nan`, `np.inf` etc. Beware of floating point precision
       errors and try to use an atypical for inputs value.
+    eps: a small number used to check whether x1 and x2 are the same up to
+      `eps`.
 
-    Example:
-      >>> x = np.ones((10, 32, 16, 3))
-      >>> o = _inputs_to_kernel(x, None,
-      >>>                       diagonal_batch=True,
-      >>>                       diagonal_spatial=False,
-      >>>                       compute_ntk=True)
-      >>> o.cov1.shape, o.ntk.shape
-      (10, 32, 32, 16, 16), (10, 10, 32, 32, 16, 16)
-      >>> o = _inputs_to_kernel(x, None,
-      >>>                       diagonal_batch=True,
-      >>>                       diagonal_spatial=True,
-      >>>                       compute_ntk=True)
-      >>> o.cov1.shape, o.ntk.shape
-      (10, 32, 16), (10, 10, 32, 16)
-      >>> x1 = np.ones((10, 128))
-      >>> x2 = np.ones((20, 128))
-      >>> o = _inputs_to_kernel(x1, x2,
-      >>>                       diagonal_batch=True,
-      >>>                       diagonal_spatial=True,
-      >>>                       compute_ntk=False)
-      >>> o.cov1.shape, o.nngp.shape
-      (10,), (10, 20)
-      >>> o.ntk
+  Returns:
+    The `Kernel` object containing inputs covariance[s].
   """
   batch_axis %= x1.ndim
 
   if batch_axis != 0:
-    # TODO: add support or clear error for batching.
+    # TODO(romann): add support or clear error for batching.
     warnings.warn(f'!!! Non-leading (!= 0) batch dimension in the '
-                  f'input layer is not supported for batching and empirical '
+                  f'input layer is not supported for batching '
                   f'kernels, got batch_axis = {batch_axis}. !!!')
 
   if channel_axis is None:
@@ -1856,7 +2039,7 @@ def _inputs_to_kernel(x1: np.ndarray,
     x = utils.get_masked_array(x, mask_constant)
     x, mask = x.masked_value, x.mask
 
-    # TODO: Think more about dtype automatic vs manual dtype promotion.
+    # TODO(schsam): Think more about dtype automatic vs manual dtype promotion.
     x = x.astype(np.float64)
 
     if diagonal_batch:
@@ -1870,7 +2053,7 @@ def _inputs_to_kernel(x1: np.ndarray,
   x2, cov2, mask2 = get_x_cov_mask(x2)
   nngp = _cov(x1, x2, diagonal_spatial, batch_axis, channel_axis)
 
-  ntk = 0. if compute_ntk else None
+  ntk = np.zeros((), nngp.dtype) if compute_ntk else None
   is_gaussian = False
   is_reversed = False
   x1_is_x2 = utils.x1_is_x2(x1, x2, eps=eps)
@@ -1893,11 +2076,12 @@ def _inputs_to_kernel(x1: np.ndarray,
                 mask1,
                 mask2)
 
+
 def _propagate_shape(init_fn: InitFn, shape: Shapes) -> Shapes:
   """Statically, abstractly, evaluate the init_fn to get shape information."""
   akey = ShapedArray((2,), np.uint32)
   closed_init_fn = functools.partial(init_fn, input_shape=shape)
-  args_flat, in_tree = tree_flatten(((akey,), {}))
+  _, in_tree = tree_flatten(((akey,), {}))
   fun, out_tree = flatten_fun(lu.wrap_init(closed_init_fn), in_tree)
   out = pe.abstract_eval_fun(fun.call_wrapped, akey)
   out_shape = tree_unflatten(out_tree(), out)[0]
@@ -1905,9 +2089,10 @@ def _propagate_shape(init_fn: InitFn, shape: Shapes) -> Shapes:
   return out_shape
 
 
-def _set_shapes(init_fn: InitFn,
-                in_kernel: Kernels,
-                out_kernel: Kernels) -> Kernels:
+def _set_shapes(
+    init_fn: InitFn,
+    in_kernel: Kernels,
+    out_kernel: Kernels) -> Kernels:
   """Apply a kernel_fn to a Kernel propagating side information."""
   if isinstance(in_kernel, Kernel):
     shape1 = _propagate_shape(init_fn, in_kernel.shape1)
@@ -1941,12 +2126,12 @@ def _fuse_reqs(kernel_fn_reqs, default_reqs, **user_reqs):
   for req, v in user_reqs.items():
     if v is not None:
       if req in kernel_fn_reqs:
-         if not kernel_fn_reqs[req] and v:
-            raise ValueError(f'Asked to compute `kernel_fn` output with '
-                             f'`{req} == {v}`, while `kernel_fn` '
-                             f'requires `{req} == {kernel_fn_reqs[req]}`.')
+        if not kernel_fn_reqs[req] and v:
+          raise ValueError(f'Asked to compute `kernel_fn` output with '
+                           f'`{req} == {v}`, while `kernel_fn` '
+                           f'requires `{req} == {kernel_fn_reqs[req]}`.')
 
-         kernel_fn_reqs[req] |= v
+        kernel_fn_reqs[req] |= v
 
       else:
         kernel_fn_reqs[req] = v
@@ -1959,8 +2144,9 @@ def _fuse_reqs(kernel_fn_reqs, default_reqs, **user_reqs):
   return frozendict.frozendict(kernel_fn_reqs)
 
 
-def _preprocess_kernel_fn(init_fn: InitFn,
-                          kernel_fn: LayerKernelFn) -> AnalyticKernelFn:
+def _preprocess_kernel_fn(
+    init_fn: InitFn,
+    kernel_fn: LayerKernelFn) -> AnalyticKernelFn:
   """Returns a `kernel_fn` with additional arguments.
 
   Args:
@@ -2071,8 +2257,20 @@ def _ab_relu(x, a, b, **kwargs):
   return a * np.minimum(x, 0) + b * np.maximum(x, 0)
 
 
-def _erf(x, **kwargs):
-  return erf(x)
+def _erf(x, a, b, c, **kwargs):
+  return a * erf(b * x) + c
+
+
+def _gelu(x, **kwargs):
+  return 0.5 * x * (1. + erf(x / np.sqrt(2.)))
+
+
+def _sin(x, a, b, c, **kwargs):
+  return a * np.sin(b * x + c)
+
+
+def _rbf(x, gamma, **kwargs):
+  return np.sqrt(2) * np.sin(np.sqrt(2 * gamma) * x + np.pi/4)
 
 
 def _arccos(x, do_backprop):
@@ -2115,11 +2313,8 @@ def _get_diagonal(
   Adapts computation if `cov` already stores only the diagonal along some
   dimensions based on `diagonal_batch` and `diagonal_spatial`.
   """
-
-  if not utils.is_array(cov):
+  if cov is None:
     return cov
-  # Needed for type inference.
-  cov = np.asarray(cov)
 
   batch_ndim = 1 if diagonal_batch else 2
   start_axis = 2 - batch_ndim
@@ -2128,15 +2323,15 @@ def _get_diagonal(
   return utils.diagonal_between(cov, start_axis, end_axis)
 
 
-def _get_diagonal_prod(cov1: np.ndarray,
-                       cov2: Optional[np.ndarray],
-                       diagonal_batch: bool,
-                       diagonal_spatial: bool,
-                       axis: Tuple[int, ...] = (),
-                       mask1: Optional[np.array] = None,
-                       mask2: Optional[np.ndarray] = None
-                       ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-
+def _get_diagonal_outer_prods(cov1: np.ndarray,
+                              cov2: Optional[np.ndarray],
+                              diagonal_batch: bool,
+                              diagonal_spatial: bool,
+                              operation: Callable[[float, float], float],
+                              axis: Tuple[int, ...] = (),
+                              mask1: Optional[np.ndarray] = None,
+                              mask2: Optional[np.ndarray] = None
+                             ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
   """Gets outer products of diagonals `cov1, cov1`, `cov1, cov2`, `cov2, cov2`.
 
   `prod11[x1, x2, h1, h2, ...]` =
@@ -2154,54 +2349,15 @@ def _get_diagonal_prod(cov1: np.ndarray,
   cov1 = _get_diagonal(cov1, diagonal_batch, diagonal_spatial)
   cov2 = _get_diagonal(cov2, diagonal_batch, diagonal_spatial)
 
-  cov1 = _mean_and_var(cov1, axis=axis, keepdims=True, mask=mask1)
-  cov2 = _mean_and_var(cov2, axis=axis, keepdims=True, mask=mask2)
+  cov1, _ = _mean_and_var(cov1, axis=axis, keepdims=True, mask=mask1)
+  cov2, _ = _mean_and_var(cov2, axis=axis, keepdims=True, mask=mask2)
 
-  end_axis = 1 if diagonal_spatial else cov1.ndim  # pytype: disable=attribute-error
-  prod12 = utils.outer_prod(cov1, cov2, 0, end_axis, op.mul)
-
-  start_axis = 1 if diagonal_batch else 0
-  prod11 = utils.outer_prod(cov1, cov1, start_axis, end_axis, op.mul)
-  prod22 = (utils.outer_prod(cov2, cov2, start_axis, end_axis, op.mul)
-            if cov2 is not None else prod11)
-
-  return prod11, prod12, prod22
-
-
-def _get_diagonal_prods(cov1: np.ndarray,
-                        cov2: Optional[np.ndarray],
-                        diagonal_batch: bool,
-                        diagonal_spatial: bool,
-                        axis: Tuple[int, ...] = (),
-                        mask1: Optional[np.ndarray] = None,
-                        mask2: Optional[np.ndarray] = None
-                        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-  """Gets outer products of diagonals `cov1, cov1`, `cov1, cov2`, `cov2, cov2`.
-
-  `prod11[x1, x2, h1, h2, ...]` =
-   cov1[x1, [x1,], h1, [h1,], ...] * cov1[x2, [x2,], h2, [h2,], ...]`,
-  `prod12[x1, x2, h1, h2, ...]` =
-   cov1[x1, [x1,], h1, [h1,], ...] * cov2[x2, [x2,], h2, [h2,], ...]`,
-  `prod22[x1, x2, h1, h2, ...]` =
-   cov2[x1, [x1,], h1, [h1,], ...] * cov2[x2, [x2,], h2, [h2,], ...]`.
-
-  Exact shapes of `cov1` and `cov2` are defined by `diagonal_batch` and
-    `diagonal_spatial`.
-  """
-  axis = utils.canonicalize_axis(axis, cov1)
-
-  cov1 = _get_diagonal(cov1, diagonal_batch, diagonal_spatial)
-  cov2 = _get_diagonal(cov2, diagonal_batch, diagonal_spatial)
-
-  cov1 = _mean_and_var(cov1, axis=axis, keepdims=True, mask=mask1)
-  cov2 = _mean_and_var(cov2, axis=axis, keepdims=True, mask=mask2)
-
-  end_axis = 1 if diagonal_spatial else cov1.ndim   # pytype: disable=attribute-error
-  prod12 = utils.outer_prod(cov1, cov2, 0, end_axis, op.mul)
+  end_axis = 1 if diagonal_spatial else cov1.ndim
+  prod12 = utils.outer_prod(cov1, cov2, 0, end_axis, operation)
 
   start_axis = 1 if diagonal_batch else 0
-  prod11 = utils.outer_prod(cov1, cov1, start_axis, end_axis, op.mul)
-  prod22 = (utils.outer_prod(cov2, cov2, start_axis, end_axis, op.mul)
+  prod11 = utils.outer_prod(cov1, cov1, start_axis, end_axis, operation)
+  prod22 = (utils.outer_prod(cov2, cov2, start_axis, end_axis, operation)
             if cov2 is not None else prod11)
 
   return prod11, prod12, prod22
@@ -2222,7 +2378,7 @@ def _get_ab_relu_kernel(ker_mat, prod, a, b, do_backprop, ntk=None):
 
 
 def _transform_kernels_ab_relu(
-    kernels: Kernel,
+    k: Kernel,
     a: float = 1.0,
     b: float = 0.0,
     do_backprop: bool = True,
@@ -2231,7 +2387,7 @@ def _transform_kernels_ab_relu(
 
   See https://arxiv.org/pdf/1711.09090.pdf for the leaky ReLU derivation.
   """
-  cov1, nngp, cov2, ntk = kernels.cov1, kernels.nngp, kernels.cov2, kernels.ntk
+  cov1, nngp, cov2, ntk = k.cov1, k.nngp, k.cov2, k.ntk
 
   if do_stabilize:
     factor = np.max([np.max(np.abs(nngp)), 1e-12])
@@ -2240,15 +2396,16 @@ def _transform_kernels_ab_relu(
     if cov2 is not None:
       cov2 /= factor
 
-  prod11, prod12, prod22 = _get_diagonal_prods(cov1,
-                                               cov2,
-                                               kernels.diagonal_batch,
-                                               kernels.diagonal_spatial)
+  prod11, prod12, prod22 = _get_diagonal_outer_prods(cov1,
+                                                     cov2,
+                                                     k.diagonal_batch,
+                                                     k.diagonal_spatial,
+                                                     op.mul)
   nngp, ntk = _get_ab_relu_kernel(nngp, prod12, a, b, do_backprop, ntk=ntk)
   if do_stabilize:
     nngp *= factor
 
-  if kernels.diagonal_batch and kernels.diagonal_spatial:
+  if k.diagonal_batch and k.diagonal_spatial:
     cov1 *= (a**2 + b**2) / 2
     if cov2 is not None:
       cov2 *= (a**2 + b**2) / 2
@@ -2262,37 +2419,42 @@ def _transform_kernels_ab_relu(
     if cov2 is not None:
       cov2 *= factor
 
-  return kernels.replace(cov1=cov1,
-                         nngp=nngp,
-                         cov2=cov2,
-                         ntk=ntk,
-                         is_gaussian=(a == b))
+  return k.replace(cov1=cov1,
+                   nngp=nngp,
+                   cov2=cov2,
+                   ntk=ntk,
+                   is_gaussian=(a == b))
 
 
-def _get_erf_kernel(ker_mat, prod, do_backprop, ntk=None):
-  dot_sigma = 4 / (np.pi * np.sqrt(prod - 4 * ker_mat**2))
-  ker_mat = _arcsin(2 * ker_mat / _safe_sqrt(prod), do_backprop) * 2 / np.pi
-
+def _get_erf_kernel(
+    ker_mat: np.ndarray,
+    prod: np.ndarray,
+    do_backprop: bool,
+    ntk: np.ndarray = None) -> Tuple[np.ndarray, Optional[np.ndarray]]:
   if ntk is not None:
+    dot_sigma = 4 / (np.pi * np.sqrt(prod - 4 * ker_mat**2))
     ntk *= dot_sigma
+  ker_mat = _arcsin(2 * ker_mat / np.sqrt(prod), do_backprop) * 2 / np.pi
+
 
   return ker_mat, ntk
 
 
-def _transform_kernels_erf(kernels: Kernel, do_backprop: bool) -> Kernel:
+def _transform_kernels_erf_non_scaled(k: Kernel, do_backprop: bool) -> Kernel:
   """Compute new kernels after an `Erf` layer."""
-  cov1, nngp, cov2, ntk = kernels.cov1, kernels.nngp, kernels.cov2, kernels.ntk
+  cov1, nngp, cov2, ntk = k.cov1, k.nngp, k.cov2, k.ntk
 
   _cov1_denom = 1 + 2 * cov1
   _cov2_denom = None if cov2 is None else 1 + 2 * cov2
 
-  prod11, prod12, prod22 = _get_diagonal_prods(_cov1_denom,
-                                               _cov2_denom,
-                                               kernels.diagonal_batch,
-                                               kernels.diagonal_spatial)
+  prod11, prod12, prod22 = _get_diagonal_outer_prods(_cov1_denom,
+                                                     _cov2_denom,
+                                                     k.diagonal_batch,
+                                                     k.diagonal_spatial,
+                                                     op.mul)
   nngp, ntk = _get_erf_kernel(nngp, prod12, do_backprop, ntk=ntk)
 
-  if kernels.diagonal_batch and kernels.diagonal_spatial:
+  if k.diagonal_batch and k.diagonal_spatial:
     cov1 = np.arcsin(2 * cov1 / _cov1_denom) * 2 / np.pi
     if cov2 is not None:
       cov2 = np.arcsin(2 * cov2 / _cov2_denom) * 2 / np.pi
@@ -2301,38 +2463,206 @@ def _transform_kernels_erf(kernels: Kernel, do_backprop: bool) -> Kernel:
     if cov2 is not None:
       cov2, _ = _get_erf_kernel(cov2, prod22, do_backprop)
 
-  return kernels.replace(cov1=cov1,
-                         nngp=nngp,
-                         cov2=cov2,
-                         ntk=ntk,
-                         is_gaussian=False)
+  return k.replace(cov1=cov1,
+                   nngp=nngp,
+                   cov2=cov2,
+                   ntk=ntk,
+                   is_gaussian=False)
+
+
+def _get_gelu_kernel(nngp: np.ndarray,
+                     prod: np.ndarray,
+                     prod_plus_1: np.ndarray,
+                     do_backprop: bool,
+                     ntk: np.ndarray = None
+                     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+  delta_squared = prod_plus_1 - nngp**2
+  delta = _safe_sqrt(delta_squared)
+  ratio = nngp / _safe_sqrt(prod_plus_1)
+  new_nngp = (nngp**2 + prod * delta_squared) / (prod_plus_1 * delta)
+  new_nngp += nngp * _arcsin(ratio, do_backprop)
+  new_nngp /= 2 * np.pi
+  new_nngp += 0.25 * nngp
+
+  if ntk is not None:
+    second_term = 0.25 + _arcsin(ratio, do_backprop) / (2 * np.pi)
+    first_term = 1 / delta_squared + (1 - prod) / prod_plus_1 + 1
+    first_term *= nngp / delta / (2. * np.pi)
+    dot_sigma = first_term + second_term
+    ntk *= dot_sigma
+  return new_nngp, ntk
+
+
+def _get_gelu_nngp_diag(nngp_diag: np.ndarray, do_backprop: bool) -> np.ndarray:
+  new_diag = nngp_diag / ((nngp_diag + 1.) * np.sqrt(1. + 2.* nngp_diag))
+  new_diag += _arcsin(nngp_diag/(nngp_diag + 1), do_backprop) / 2
+  new_diag /= np.pi
+  new_diag += 0.25
+  new_diag *= nngp_diag
+  return new_diag
+
+
+def _transform_kernels_gelu(k: Kernel, do_backprop: bool) -> Kernel:
+  """Compute new kernels after an `Gelu` layer; NNGP see `arXiv:2002.08517`."""
+  cov1, nngp, cov2, ntk = k.cov1, k.nngp, k.cov2, k.ntk
+
+  cov1_plus_1 = cov1 + 1
+  cov2_plus_1 = None if cov2 is None else cov2 + 1
+
+  prod11_plus_1, prod12_plus_1, prod22_plus_1 = _get_diagonal_outer_prods(
+      cov1_plus_1, cov2_plus_1, k.diagonal_batch, k.diagonal_spatial, op.mul)
+  prod11, prod12, prod22 = _get_diagonal_outer_prods(
+      cov1, cov2, k.diagonal_batch, k.diagonal_spatial, op.mul)
+
+  nngp, ntk = _get_gelu_kernel(nngp, prod12, prod12_plus_1, do_backprop,
+                               ntk=ntk)
+
+  if k.diagonal_batch and k.diagonal_spatial:
+    cov1 = _get_gelu_nngp_diag(cov1, do_backprop)
+    if cov2 is not None:
+      cov2 = _get_gelu_nngp_diag(cov2, do_backprop)
+  else:
+    cov1, _ = _get_gelu_kernel(cov1, prod11, prod11_plus_1, do_backprop)
+    if cov2 is not None:
+      cov2, _ = _get_gelu_kernel(cov2, prod22, prod22_plus_1, do_backprop)
+
+  return k.replace(cov1=cov1,
+                   nngp=nngp,
+                   cov2=cov2,
+                   ntk=ntk,
+                   is_gaussian=False)
+
+
+def _transform_kernels_affine_erf(
+    k: Kernel,
+    do_backprop: bool,
+    a: float = 1.0,
+    b: float = 1.0,
+    c: float = 0.0) -> Kernel:
+  old_nngp = k.nngp
+  k = k.replace(cov1=b**2 * k.cov1,
+                nngp=b**2 * k.nngp,
+                cov2=None if k.cov2 is None else b**2 * k.cov2,
+                ntk=None if k.ntk is None else b**2 * k.ntk,
+                is_gaussian=False)
+  k = _transform_kernels_erf_non_scaled(k, do_backprop)
+  return k.replace(
+      cov1=_affine(k.cov1, a, c),
+      nngp=_affine(k.nngp, a, c),
+      cov2=_affine(k.cov2, a, c),
+      ntk=None if k.ntk is None else _affine(k.ntk, a, 0.))
+
+
+def _transform_kernels_sin(
+    k: Kernel,
+    a: float = 1.0,
+    b: float = 1.0,
+    c: float = 0.0) -> Kernel:
+  """Compute new kernels after an `Sin` layer."""
+  cov1, nngp, cov2, ntk = k.cov1, k.nngp, k.cov2, k.ntk
+
+  sum11, sum12, sum22 = _get_diagonal_outer_prods(cov1,
+                                                  cov2,
+                                                  k.diagonal_batch,
+                                                  k.diagonal_spatial,
+                                                  op.add)
+  half_a_square = a**2 / 2.
+  def _get_sin_kernel(sum_, cov, ntk):
+    s1 = np.exp(b**2 * (-0.5 * sum_ + cov))
+    s2 = np.exp(b**2 * (-0.5 * sum_ - cov)) * np.cos(2*c)
+    nngp = half_a_square * (s1 - s2)
+    if ntk is not None:
+      ntk *= half_a_square * b**2 * (s1 + s2)
+    return nngp, ntk
+  def _get_diag_sin_kernel(mat):
+    return half_a_square *(1. - np.exp(-b**2 * mat) *np.cos(2*c))
+  nngp, ntk = _get_sin_kernel(sum12, nngp, ntk)
+
+  if k.diagonal_batch and k.diagonal_spatial:
+    cov1 = _get_diag_sin_kernel(sum11)
+    if cov2 is not None:
+      cov2 = _get_diag_sin_kernel(sum22)
+  else:
+    cov1 = _get_sin_kernel(sum11, cov1, None)[0]
+    if cov2 is not None:
+      cov2 = _get_sin_kernel(sum22, cov2, None)[0]
+
+  return k.replace(cov1=cov1,
+                   nngp=nngp,
+                   cov2=cov2,
+                   ntk=ntk,
+                   is_gaussian=False)
+
+
+def _transform_kernels_rbf(
+    k: Kernel,
+    gamma: float = 1.0) -> Kernel:
+  """Compute new kernels after an `Rbf` layer."""
+  cov1, nngp, cov2, ntk = k.cov1, k.nngp, k.cov2, k.ntk
+
+  sum11, sum12, sum22 = _get_diagonal_outer_prods(cov1,
+                                                  cov2,
+                                                  k.diagonal_batch,
+                                                  k.diagonal_spatial,
+                                                  op.add)
+
+  def _get_rbf_kernel(sum_, cov, ntk):
+    s1 = np.exp(gamma * (-sum_ + 2 * cov))
+    nngp = s1
+    if ntk is not None:
+      ntk *= 2 * gamma * s1
+    return nngp, ntk
+
+  nngp, ntk = _get_rbf_kernel(sum12, nngp, ntk)
+
+  if k.diagonal_batch and k.diagonal_spatial:
+    cov1 = np.ones_like(sum11)
+    if cov2 is not None:
+      cov2 = np.ones_like(sum22)
+  else:
+    cov1 = _get_rbf_kernel(sum11, cov1, None)[0]
+    if cov2 is not None:
+      cov2 = _get_rbf_kernel(sum22, cov2, None)[0]
+
+  return k.replace(cov1=cov1, nngp=nngp, cov2=cov2, ntk=ntk, is_gaussian=False)
 
 
 def _transform_kernels(
-    kernels: Kernel, fn: Callable[[float], float], **fn_kwargs) -> Kernel:
+    k: Kernel,
+    fn: Callable[[float], float],
+    **fn_kwargs) -> Kernel:
   """Apply transformation to kernels.
 
   Args:
-    kernels: a `Kernel` object.
-    fn: nonlinearity function, can only be Relu, Erf or Identity.
+    k: a `Kernel` object.
+    fn: nonlinearity function, can only be Relu, Erf, Sine or Identity.
+    **fn_kwargs: arguments passed to a `_transform_kernels_<name>` function.
+
   Returns:
     The transformed kernel.
   """
-  if not kernels.is_gaussian:
+  if not k.is_gaussian:
     raise ValueError('An affine layer (i.e. dense or convolution) '
                      'has to be applied before a nonlinearity layer.')
   if fn is _ab_relu:
-    return _transform_kernels_ab_relu(kernels, **fn_kwargs)
+    return _transform_kernels_ab_relu(k, **fn_kwargs)
   if fn is _erf:
-    return _transform_kernels_erf(kernels, **fn_kwargs)
-  # TODO: Monte Carlo approximation to the integral (suggested by schsam.)
-  raise NotImplementedError('Analaytic kernel for activiation {} is not '
-                            'implmented'.format(fn))
+    return _transform_kernels_affine_erf(k, **fn_kwargs)
+  if fn is _sin:
+    return _transform_kernels_sin(k, **fn_kwargs)
+  if fn is _rbf:
+    return _transform_kernels_rbf(k, **fn_kwargs)
+  if fn is _gelu:
+    return _transform_kernels_gelu(k, **fn_kwargs)
+  # TODO(xlc): Monte Carlo approximation to the integral (suggested by schsam@.)
+  raise NotImplementedError(f'Analaytic kernel for activiation {fn} is not '
+                            f'implmented.')
 
 
-def _affine(mat: Union[np.ndarray, float, None],
-            W_std: float,
-            b_std: float) -> Union[np.ndarray, float, None]:
+def _affine(
+    mat: Optional[np.ndarray],
+    W_std: float,
+    b_std: float) -> Optional[np.ndarray]:
   """Get covariances of affine outputs if inputs have covariances `nngp`.
 
   The output is assumed to be `xW + b`, where `x` is the input, `W` is a matrix
@@ -2355,7 +2685,7 @@ def _affine(mat: Union[np.ndarray, float, None],
   return  W_std**2 * mat + b_std**2
 
 
-def _fan_in_kernel_fn(kernels, axis):
+def _fan_in_kernel_fn(kernels: List[Kernel], axis: Optional[int]) -> Kernel:
   diagonal_batch = kernels[0].diagonal_batch
   diagonal_spatial = kernels[0].diagonal_spatial
 
@@ -2418,14 +2748,14 @@ def _fan_in_kernel_fn(kernels, axis):
                                 '-zero Gaussian, i.e. having all `is_gaussian '
                                 'set to `True`.')
   else:
-    # TODO: allow to apply nonlinearity after channelwise concatenation.
-    # TODO: support concatenating different channelwise masks.
+    # TODO(romann): allow to apply nonlinearity after channelwise concatenation.
+    # TODO(romann): support concatenating different channelwise masks.
     is_gaussian = False
 
   # Warnings.
   warnings.warn('`FanIn` layers assume independent inputs which is not verified'
                 ' in the code. Please make sure to have at least one `Dense` / '
-                '`Conv` / `GlobalSenfAttention` etc. layer in each branch.')
+                '`Conv` / `GlobalSelfAttention` etc. layer in each branch.')
   if axis == batch_axis:
     warnings.warn(f'Concatenation along the batch axis ({axis}) gives '
                   f'inconsistent covariances when batching - '
@@ -2477,11 +2807,11 @@ def _fan_in_kernel_fn(kernels, axis):
 
 
 def _concat_kernels(
-    mats: List[np.ndarray],
+    mats: List[Optional[np.ndarray]],
     axis: int,
     diagonal_batch: bool,
     diagonal_spatial: bool,
-    widths: List[int]) -> np.ndarray:
+    widths: List[int]) -> Optional[np.ndarray]:
   """Compute the covariance of concatenated activations with given covariances.
 
   Args:
@@ -2545,15 +2875,16 @@ def _concat_kernels(
   return mat
 
 
-def _same_pad_for_filter_shape(x: Union[np.ndarray, float, None],
-                               filter_shape: Tuple[int, ...],
-                               strides: Tuple[int, ...],
-                               axes: Tuple[int, ...],
-                               mode: str) -> Union[None, float, np.ndarray]:
+def _same_pad_for_filter_shape(
+    x: np.ndarray,
+    filter_shape: Tuple[int, ...],
+    strides: Tuple[int, ...],
+    axes: Tuple[int, ...],
+    mode: str) -> np.ndarray:
   """Pad an array to imitate `SAME` padding with `VALID`.
 
-  See `Returns` section for details. This method is usually needed to implement
-    `CIRCULAR` padding using `VALID` padding.
+  See `Returns` section for details. This function is usually needed to
+    implement `CIRCULAR` padding using `VALID` padding.
 
   Args:
     x: `np.ndarray` to pad, e.g. a 4D `NHWC` image.
@@ -2570,11 +2901,6 @@ def _same_pad_for_filter_shape(x: Union[np.ndarray, float, None],
     larger shape such that a `VALID` convolution with `filter_shape` applied
     to `x` over `axes` outputs an array of the same shape as `x`.
   """
-  if not utils.is_array(x):
-    return x
-  # Needed for type inference.
-  x = np.asarray(x)
-
   axes_shape = tuple(np.size(x, axis) for axis in axes)
   axes_pads = lax.padtype_to_pads(axes_shape, filter_shape, strides,
                                   Padding.SAME.name)
@@ -2587,43 +2913,13 @@ def _same_pad_for_filter_shape(x: Union[np.ndarray, float, None],
   return x
 
 
-def _pad_one_side(
-    x: np.ndarray,
-    pads: Tuple[int, ...],
-    axes: Tuple[int, ...],
-    mode: str) -> np.ndarray:
-  """Pad an array on one side. See `Returns` section for details.
-
-  Args:
-    x: `np.ndarray` to pad, e.g. a 4D `NHWC` image.
-    pads: tuple of integers, the convolutional filters spatial
-      shape (e.g. `(3, 3)` for a 2D convolution).
-    axes: tuple of non-negative integers, the axes to apply padding of sizes
-      `pads` to.
-    mode: a string, padding mode, for all options see
-      https://docs.scipy.org/doc/numpy/reference/generated/numpy.pad.html.
-
-  Returns:
-    A `np.ndarray` of the same dimensionality as `x` padded to a potentially
-      larger shape with `pads` applied at `axes`, where positive values in
-      `pads` are applied on the left (start), and negative on the right (end).
-  """
-  axis_pads = [(p, 0) if p >= 0 else (0, -p) for p in pads]
-  pads_list = [(0, 0),] * x.ndim
-  for i in range(len(axes)):
-    pads_list[axes[i]] = axis_pads[i]
-  x = np.pad(x, pads_list, mode)
-  return x
-
-def asarray(x: Union[np.array, float, None]) -> np.array:
-  return x
-
-def _conv_kernel_full_spatial(mat: Union[np.ndarray, float, None],
-                              filter_shape: Tuple[int, ...],
-                              strides: Tuple[int, ...],
-                              padding: Padding,
-                              batch_ndim: int
-                              ) -> Union[None, float, np.ndarray]:
+def _conv_kernel_full_spatial(
+    mat: Optional[np.ndarray],
+    filter_shape: Tuple[int, ...],
+    strides: Tuple[int, ...],
+    padding: Padding,
+    batch_ndim: int
+    ) -> Optional[np.ndarray]:
   """Compute covariance of the CNN outputs given inputs with covariance `mat`.
 
   Used when `kernel.diagonal_spatial == False`.
@@ -2648,10 +2944,8 @@ def _conv_kernel_full_spatial(mat: Union[np.ndarray, float, None],
     `(batch_size_1, [batch_size_2,] new_width, new_width,
       new_height, new_height, new_depth, new_depth, ...)`.
   """
-  if not utils.is_array(mat):
+  if mat is None or mat.ndim == 0:
     return mat
-  # Needed for type inference.
-  mat = np.asarray(mat)
 
   if padding == Padding.CIRCULAR:
     spatial_axes = tuple(range(batch_ndim, mat.ndim))
@@ -2664,11 +2958,11 @@ def _conv_kernel_full_spatial(mat: Union[np.ndarray, float, None],
     )
     padding = Padding.VALID
 
-  for i in range(mat.ndim - 1, batch_ndim, -2):  # pytype: disable=attribute-error
+  for i in range(mat.ndim - 1, batch_ndim, -2):
     spatial_i = (i - batch_ndim) // 2
     filter_i = filter_shape[spatial_i]
     stride_i = strides[spatial_i]
-    size_i = mat.shape[i]  # pytype: disable=attribute-error
+    size_i = mat.shape[i]
 
     mat = np.moveaxis(mat, (i - 1, i), (-2, -1))
     mat_preshape = mat.shape[:-2]
@@ -2678,7 +2972,7 @@ def _conv_kernel_full_spatial(mat: Union[np.ndarray, float, None],
 
     platform = xla_bridge.get_backend().platform
     if platform in ['gpu', 'tpu']:
-      batch_and_channels = functools.reduce(op.mul, mat_preshape, 1)
+      batch_and_channels = utils.size_at(mat_preshape)
       n_channels = batch_and_channels
 
       # Find smallest `n_channels > 1` that divides `batch_and_features`; use
@@ -2726,12 +3020,13 @@ def _conv_kernel_full_spatial(mat: Union[np.ndarray, float, None],
   return mat
 
 
-def _conv_kernel_diagonal_spatial(mat: Union[np.ndarray, float, None],
-                                  filter_shape: Tuple[int, ...],
-                                  strides: Tuple[int, ...],
-                                  padding: Padding,
-                                  batch_ndim: int
-                                  ) -> Union[None, float, np.ndarray]:
+def _conv_kernel_diagonal_spatial(
+    mat: Optional[np.ndarray],
+    filter_shape: Tuple[int, ...],
+    strides: Tuple[int, ...],
+    padding: Padding,
+    batch_ndim: int
+    ) -> Optional[np.ndarray]:
   """Compute covariance of the CNN outputs given inputs with covariance `mat`.
 
   Used when `kernel.diagonal_spatial == True`.
@@ -2754,10 +3049,8 @@ def _conv_kernel_diagonal_spatial(mat: Union[np.ndarray, float, None],
     batch and `S` spatial dimensions with the shape of
     `(batch_size_1, [batch_size_2,] new_height, new_width, new_depth, ...)`.
   """
-  if not utils.is_array(mat):
+  if mat is None or mat.ndim == 0:
     return mat
-  # Needed for type inference.
-  mat = np.asarray(mat)
 
   if padding == Padding.CIRCULAR:
     spatial_axes = tuple(range(mat.ndim)[batch_ndim:])
@@ -2773,60 +3066,14 @@ def _conv_kernel_diagonal_spatial(mat: Union[np.ndarray, float, None],
   return mat
 
 
-def _conv_kernel_over_spatial(mat: Union[np.ndarray, float, None],
-                              filter_shape: Tuple[int, ...],
-                              strides: Tuple[int, ...],
-                              padding: Padding,
-                              batch_ndim: int
-                              ) -> Union[np.ndarray, float, None]:
-  """Compute covariance of the CNN outputs given inputs with covariance `mat`.
-
-  Used when `kernel.diagonal_spatial == True`.
-
-  Args:
-    mat: an `(S+batch_ndim)`-dimensional `np.ndarray` containing
-      sample-sample-(same position) covariances of CNN inputs. Has `batch_ndim`
-      batch and `S` spatial dimensions with the shape of
-      `(batch_size_1, [batch_size_2,] height, width, depth, ...)`.
-    filter_shape: tuple of positive integers, the convolutional filters spatial
-      shape (e.g. `(3, 3)` for a 2D convolution).
-    strides: tuple of positive integers, the CNN strides (e.g. `(1, 1)` for a
-      2D convolution).
-    padding: a `Padding` enum, e.g. `Padding.CIRCULAR`.
-    batch_ndim: integer, number of leading batch dimensions, 1 or 2.
-
-  Returns:
-    an `(S+batch_ndim)`-dimensional `np.ndarray` containing
-    sample-sample-(same position) covariances of CNN outputs. Has `batch_ndim`
-    batch and `S` spatial dimensions with the shape of
-    `(batch_size_1, [batch_size_2,] new_height, new_width, new_depth, ...)`.
-  """
-  if not utils.is_array(mat):
-    return mat
-  # Needed for type inference.
-  mat = np.asarray(mat)
-
-  if padding == Padding.CIRCULAR:
-    spatial_axes = tuple(range(mat.ndim)[batch_ndim:])
-    mat = _same_pad_for_filter_shape(mat, filter_shape, strides,
-                                     spatial_axes, 'wrap')
-    padding = Padding.VALID
-
-  filter_size = functools.reduce(op.mul, filter_shape, 1)
-  filter_shape = (1,) * batch_ndim + filter_shape
-  strides = (1,) * batch_ndim + strides
-  mat = lax._reduce_window_sum(mat, filter_shape, strides, padding.name)
-  mat /= filter_size
-  return mat
-
-
-def _pool_kernel(mat: Union[np.ndarray, float, None],
-                 pool_type: Pooling,
-                 window_shape: Tuple[int, ...],
-                 strides: Tuple[int, ...],
-                 padding: Padding,
-                 normalize_edges: bool,
-                 batch_ndim: int) -> Union[np.ndarray, float, None]:
+def _pool_kernel(
+    mat: Optional[np.ndarray],
+    pool_type: Pooling,
+    window_shape: Tuple[int, ...],
+    strides: Tuple[int, ...],
+    padding: Padding,
+    normalize_edges: bool,
+    batch_ndim: int) -> Optional[np.ndarray]:
   """Get covariances of pooling outputs given inputs covariances `mat`.
 
   Args:
@@ -2853,10 +3100,8 @@ def _pool_kernel(mat: Union[np.ndarray, float, None],
       `(batch_size_1, [batch_size_2,]
         height, height, width, width, depth, depth, ...)`.
   """
-  if not utils.is_array(mat):
+  if mat is None or mat.ndim == 0:
     return mat
-  # Needed for type inference.
-  mat = np.asarray(mat)
 
   if padding == Padding.CIRCULAR:
     spatial_axes = tuple(range(batch_ndim, mat.ndim))
@@ -2875,7 +3120,7 @@ def _pool_kernel(mat: Union[np.ndarray, float, None],
     if padding == Padding.SAME and normalize_edges:
       # `SAME` padding in `jax.experimental.stax.AvgPool` normalizes by actual
       # window size, which is smaller at the edges.
-      one = np.ones(mat.shape, mat.dtype)  # pytype: disable=attribute-error
+      one = np.ones_like(mat, mat.dtype)
       window_sizes = lax.reduce_window(one, 0., lax.add, window_shape, strides,
                                        padding.name)
       nngp_out /= window_sizes
@@ -2885,7 +3130,10 @@ def _pool_kernel(mat: Union[np.ndarray, float, None],
   return nngp_out
 
 
-def _diag_mul_full_spatial(x, factor, diagonal_batch):
+def _diag_mul_full_spatial(
+    x: np.ndarray,
+    factor: float,
+    diagonal_batch: bool) -> np.ndarray:
   if diagonal_batch:
     idx = (slice(None),)
     batch_ndim = 1
@@ -2906,7 +3154,10 @@ def _diag_mul_full_spatial(x, factor, diagonal_batch):
   return x
 
 
-def _diag_mul_diagonal_spatial(x, factor, diagonal_batch):
+def _diag_mul_diagonal_spatial(
+    x: np.ndarray,
+    factor: float,
+    diagonal_batch: bool) -> np.ndarray:
   if diagonal_batch:
     x *= factor
 
@@ -2919,8 +3170,12 @@ def _diag_mul_diagonal_spatial(x, factor, diagonal_batch):
   return x
 
 
-def _diag_mul(x, factor, diagonal_batch, diagonal_spatial):
-  if not utils.is_array(x):
+def _diag_mul(
+    x: Optional[np.ndarray],
+    factor: float,
+    diagonal_batch: bool,
+    diagonal_spatial: bool) -> Optional[np.ndarray]:
+  if x is None:
     return x
 
   if diagonal_spatial:
@@ -2935,9 +3190,10 @@ def _diag_mul(x, factor, diagonal_batch, diagonal_spatial):
 _NEG_INF = -1e20  # softmax raises an error if all entries are -np.inf
 
 
-def _check_is_implemented(mask: np.ndarray,
-                          padding: Optional[Padding],
-                          channel_axis: int) -> None:
+def _check_is_implemented(
+    mask: np.ndarray,
+    padding: Optional[Padding],
+    channel_axis: int) -> None:
   if padding == Padding.CIRCULAR:
     raise NotImplementedError(f'{padding} padding is not implemented for '
                               f'masked inputs.')
@@ -2951,30 +3207,28 @@ def _check_is_implemented(mask: np.ndarray,
 
 
 def _mean_and_var(
-    x: Union[float, None, np.ndarray],
-    axis: Tuple[int, ...],
+    x: Optional[np.ndarray],
+    axis: Axes = None,
     dtype: np.dtype = None,
     out: None = None,
     ddof: int = 0,
     keepdims: bool = False,
     mask: np.ndarray = None,
     get_var: bool = False
-    ) -> Union[float, None, np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
   """`np.mean` and `np.var` taking the `mask` information into account."""
-  if not utils.is_array(x):
-    return x
-  # Needed for type inference.
-  x = np.asarray(x)
+  var = None
+  if x is None:
+    return x, var
 
   if mask is None:
     mean = np.mean(x, axis, dtype, out, keepdims)
-
     if get_var:
       var = np.var(x, axis, dtype, out, ddof, keepdims)
 
   else:
-    axis = utils.canonicalize_axis(axis, x)
-    size = _size_at(x, axis)
+    axis = tuple(utils.canonicalize_axis(axis, x))
+    size = utils.size_at(x, axis)
     mask = np.broadcast_to(mask, x.shape)
     mask_size = np.count_nonzero(mask, axis)
     for i in axis:
@@ -2991,10 +3245,7 @@ def _mean_and_var(
       if not keepdims:
         var = np.squeeze(var, axis)
 
-  if get_var:
-    return mean, var
-
-  return mean
+  return mean, var
 
 
 def _sum_masks(masks: List[Optional[np.ndarray]]) -> Optional[np.ndarray]:
@@ -3015,9 +3266,10 @@ def _map_tuples(fn: Callable, tuples: Iterable[Tuple]) -> Tuple:
   return tuple(map(fn, zip(*(t for t in tuples))))
 
 
-def _concat_masks(masks: List[Optional[np.ndarray]],
-                  input_shapes: List[Tuple[int, ...]],
-                  axis: int) -> Optional[np.ndarray]:
+def _concat_masks(
+    masks: List[Optional[np.ndarray]],
+    input_shapes: List[Tuple[int, ...]],
+    axis: int) -> Optional[np.ndarray]:
   """Returns a mask which is a concatenation of `masks`.
 
   Since elements of `masks` can have any shapes broadcastable to respective
@@ -3066,12 +3318,13 @@ def _concat_masks(masks: List[Optional[np.ndarray]],
   return np.concatenate(masks, axis)
 
 
-def _pool_mask(mask: np.ndarray,
-               window_shape: Union[List[int], Tuple[int, ...]],
-               strides: Union[List[int], Tuple[int, ...]],
-               padding: Padding,
-               batch_axis: int,
-               channel_axis: int) -> np.ndarray:
+def _pool_mask(
+    mask: np.ndarray,
+    window_shape: Union[List[int], Tuple[int, ...]],
+    strides: Union[List[int], Tuple[int, ...]],
+    padding: Padding,
+    batch_axis: int,
+    channel_axis: int) -> np.ndarray:
   window_shape = list(window_shape)
   strides = list(strides)
 
